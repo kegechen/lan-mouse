@@ -1,0 +1,684 @@
+<#
+.SYNOPSIS
+    Lan Mouse KVM 一键部署/连接（patched-uinput 版）。
+
+.DESCRIPTION
+    通过 SSH 探测远端环境，按需安装/启动 lan-mouse，并启动 Windows 端 daemon
+    完成对接。第一次运行会进入交互配置向导（询问 SSH 目标 + UOS 方向 + 主机 IP）
+    并保存到 .connect-config.json，后续运行无需再问。
+    SSH 公钥认证（请先 ssh-copy-id 配置好密钥）；安装时一次性 prompt sudo 密码。
+
+.PARAMETER Target
+    SSH 目标 user@host。覆盖配置文件。
+
+.PARAMETER Direction
+    UOS 在 Windows 桌面的方向：left/right/top/bottom。覆盖配置文件。
+
+.PARAMETER Port
+    lan-mouse UDP 端口。默认 4242。
+
+.PARAMETER WinHostIp
+    Windows 主机在远端能看到的 IP（通常 = ICS 网关 192.168.137.1）。覆盖配置文件。
+
+.PARAMETER Hostname
+    远端在 Windows 配置中的 hostname（仅 toml 显示用）。默认 uos。
+
+.PARAMETER Setup
+    强制进入交互配置向导（即使已有 .connect-config.json）。
+
+.PARAMETER Force
+    强制重新拉源码 + 重新编译。
+
+.PARAMETER Stop
+    停止两端 daemon 后退出。
+#>
+[CmdletBinding()]
+param(
+    [string]$Target,
+    [ValidateSet('left','right','top','bottom')]
+    [string]$Direction,
+    [int]$Port,
+    [string]$WinHostIp,
+    [string]$Hostname,
+    [int]$DwellMs,
+    [int]$ClipsyncPort = 4243,
+    [switch]$NoClipsync,
+    [switch]$DemoIndicator,
+    [switch]$Setup,
+    [switch]$Force,
+    [switch]$Stop
+)
+
+$ErrorActionPreference = 'Stop'
+$ScriptDir   = Split-Path -Parent $MyInvocation.MyCommand.Path
+$PatchDir    = Join-Path $ScriptDir 'patches'
+$WinBinDir   = Join-Path $ScriptDir 'bin'
+$WinExe      = Join-Path $WinBinDir 'lan-mouse.exe'
+$WinCfg      = Join-Path $ScriptDir 'config.toml'
+$ConfigPath  = Join-Path $ScriptDir '.connect-config.json'
+
+# ---------- output helpers ----------
+function Write-Step($msg) { Write-Host ("`n[==] " + $msg) -ForegroundColor Cyan }
+function Write-OK($msg)   { Write-Host ("  [OK] " + $msg) -ForegroundColor Green }
+function Write-Sub($msg)  { Write-Host ("       " + $msg) -ForegroundColor DarkGray }
+function Write-Warn2($msg){ Write-Host ("  [!!] " + $msg) -ForegroundColor Yellow }
+function Write-Err2($msg) { Write-Host ("  [XX] " + $msg) -ForegroundColor Red }
+
+# ---------- config load / save ----------
+function Load-Config {
+    if (Test-Path $ConfigPath) {
+        try { return (Get-Content $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json) }
+        catch { Write-Warn2 "配置文件损坏，将忽略: $ConfigPath"; return $null }
+    }
+    return $null
+}
+function Save-Config($cfg) {
+    $cfg | ConvertTo-Json | Set-Content -Path $ConfigPath -Encoding UTF8
+}
+
+# ---------- interactive wizard ----------
+function Run-SetupWizard {
+    param($Existing)
+    Write-Host ""
+    Write-Host "  === 配置向导（首次运行 / -Setup） ===" -ForegroundColor Cyan
+    Write-Host ""
+
+    # 1. SSH target
+    $defT = if ($Existing -and $Existing.Target) { $Existing.Target } else { 'uos@192.168.137.27' }
+    Write-Host "  1. SSH 目标地址" -ForegroundColor White
+    Write-Host "     格式: user@host  (远端 Linux 机器，需已配好公钥免密 ssh)"
+    $t = Read-Host "     [回车 = $defT]"
+    if ([string]::IsNullOrWhiteSpace($t)) { $t = $defT }
+
+    # 2. Direction
+    $defDir = if ($Existing -and $Existing.Direction) { $Existing.Direction } else { 'left' }
+    $defNum = @{ left=1; right=2; top=3; bottom=4 }[$defDir]
+    Write-Host ""
+    Write-Host "  2. 远端机器在 Windows 桌面的物理位置" -ForegroundColor White
+    Write-Host "     (鼠标会从这个方向滑出 Windows 屏幕越界过去)"
+    Write-Host "       1) [<-] 左侧 (left)"
+    Write-Host "       2) [->] 右侧 (right)"
+    Write-Host "       3) [^]  上方 (top)"
+    Write-Host "       4) [v]  下方 (bottom)"
+    $dnum = Read-Host "     [回车 = $defNum]"
+    if ([string]::IsNullOrWhiteSpace($dnum)) { $dnum = $defNum }
+    if ($dnum -notmatch '^[1-4]$') {
+        Write-Warn2 "无效输入，使用默认 $defDir"
+        $dnum = $defNum
+    }
+    $dir = @('left','right','top','bottom')[[int]$dnum - 1]
+
+    # 3. Windows host IP (visible from remote)
+    $defIp = if ($Existing -and $Existing.WinHostIp) { $Existing.WinHostIp } else { '192.168.137.1' }
+    Write-Host ""
+    Write-Host "  3. Windows 主机在远端能访问到的 IP" -ForegroundColor White
+    Write-Host "     (Win10/11 移动热点共享时通常是 192.168.137.1，即 ICS 网关)"
+    $ip = Read-Host "     [回车 = $defIp]"
+    if ([string]::IsNullOrWhiteSpace($ip)) { $ip = $defIp }
+
+    # 4. Port (advanced; usually default)
+    $defP = if ($Existing -and $Existing.Port) { $Existing.Port } else { 4242 }
+    Write-Host ""
+    Write-Host "  4. lan-mouse UDP 端口" -ForegroundColor White
+    $pIn = Read-Host "     [回车 = $defP]"
+    if ([string]::IsNullOrWhiteSpace($pIn)) { $pIn = $defP }
+    if ($pIn -notmatch '^\d+$') {
+        Write-Warn2 "无效端口，使用默认 $defP"
+        $pIn = $defP
+    }
+
+    $newCfg = [PSCustomObject]@{
+        Target    = $t
+        Direction = $dir
+        WinHostIp = $ip
+        Port      = [int]$pIn
+        Hostname  = if ($Existing -and $Existing.Hostname) { $Existing.Hostname } else { 'uos' }
+    }
+    Save-Config $newCfg
+    Write-Host ""
+    Write-OK "配置已保存: $ConfigPath"
+    Write-Sub ("   target=" + $newCfg.Target + ", direction=" + $newCfg.Direction + ", win-ip=" + $newCfg.WinHostIp + ", port=" + $newCfg.Port)
+    return $newCfg
+}
+
+# ---------- ssh / scp helpers ----------
+# -o LogLevel=ERROR 抑制 "WARNING: connection is not using a post-quantum..."
+# 那行 stderr 警告——它会让 PS 5.1 在 2>&1 合并流时卡住等不到 EOF。
+$script:SshOpts = @('-o','LogLevel=ERROR','-o','ServerAliveInterval=5','-o','ServerAliveCountMax=3')
+
+function Invoke-Ssh {
+    param([string]$Cmd, [string]$Stdin = $null)
+    if ($null -ne $Stdin) {
+        # PS 5.1 的 "$str | & ssh.exe" 不会正确关闭 ssh 的 stdin，
+        # 导致远端 `bash -s` 死等 EOF。改用 ProcessStartInfo 显式 Close。
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = 'ssh.exe'
+        $argList = @($script:SshOpts) + @($script:ResolvedTarget, $Cmd)
+        $psi.Arguments = ($argList | ForEach-Object {
+            if ($_ -match '[\s"]') { '"' + ($_ -replace '"','\"') + '"' } else { $_ }
+        }) -join ' '
+        $psi.UseShellExecute        = $false
+        $psi.RedirectStandardInput  = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError  = $true
+        $psi.CreateNoWindow         = $true
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        $proc.StandardInput.Write($Stdin)
+        $proc.StandardInput.Close()
+        if (-not $proc.WaitForExit(60000)) {
+            try { $proc.Kill() } catch {}
+            return "(timeout 60s)"
+        }
+        $out = $proc.StandardOutput.ReadToEnd() + $proc.StandardError.ReadToEnd()
+        return $out
+    }
+    return (& ssh.exe @script:SshOpts $script:ResolvedTarget $Cmd 2>&1)
+}
+function Test-Ssh {
+    # 用 Start-Job 包硬超时，避免 ssh.exe hang 时整个脚本卡住
+    $job = Start-Job -ScriptBlock {
+        param($t)
+        & ssh.exe -o ConnectTimeout=5 `
+                  -o BatchMode=yes `
+                  -o StrictHostKeyChecking=accept-new `
+                  -o PasswordAuthentication=no `
+                  -o KbdInteractiveAuthentication=no `
+                  $t "echo ok" 2>&1
+    } -ArgumentList $script:ResolvedTarget
+    $waited = Wait-Job -Job $job -Timeout 10
+    if ($null -eq $waited) {
+        try { Stop-Job $job -ErrorAction SilentlyContinue } catch {}
+        try { Remove-Job $job -Force -ErrorAction SilentlyContinue } catch {}
+        Write-Sub "(ssh 连通性测试 10 秒未返回，已强制中断)"
+        return $false
+    }
+    $r = Receive-Job $job 2>&1
+    Remove-Job $job -Force -ErrorAction SilentlyContinue
+    return ((($r | Out-String) -match 'ok'))
+}
+function Copy-ToRemote {
+    param([string]$Local, [string]$Remote)
+    & scp.exe -q $Local "$($script:ResolvedTarget):$Remote" 2>&1 | Out-Null
+}
+
+# ---------- probe remote state ----------
+function Probe-Remote {
+    $script = @'
+INSTALLED=$([ -x "$HOME/.cargo/bin/lan-mouse" ] && echo yes || echo no)
+RUNNING=$(pgrep -f "cargo/bin/lan-mouse -d" >/dev/null 2>&1 && echo yes || echo no)
+UINPUT_PERMS=$(stat -c "%a:%U:%G" /dev/uinput 2>/dev/null)
+UINPUT_OK=$([ -w /dev/uinput ] && echo yes || echo no)
+ARCH=$(uname -m)
+ACTIVE_CONN=$(nmcli -t -f NAME c show --active 2>/dev/null | head -1)
+NM_PS="?"
+if [ -n "$ACTIVE_CONN" ]; then
+    NM_PS=$(nmcli -t -f 802-11-wireless.powersave c show "$ACTIVE_CONN" 2>/dev/null | awk -F: '{print $2}')
+fi
+LAN_VER=""
+[ -x "$HOME/.cargo/bin/lan-mouse" ] && LAN_VER=$($HOME/.cargo/bin/lan-mouse --version 2>&1 | head -1)
+echo "INSTALLED=$INSTALLED"
+echo "RUNNING=$RUNNING"
+echo "UINPUT_PERMS=$UINPUT_PERMS"
+echo "UINPUT_OK=$UINPUT_OK"
+echo "ARCH=$ARCH"
+echo "NM_POWERSAVE=$NM_PS"
+echo "LAN_VER=$LAN_VER"
+'@
+    $out = Invoke-Ssh "bash -s" -Stdin $script
+    $h = @{}
+    foreach ($line in ($out -split "`r?`n")) {
+        if ($line -match '^([A-Z_]+)=(.*)$') { $h[$matches[1]] = $matches[2].Trim() }
+    }
+    return $h
+}
+
+# ---------- install on remote ----------
+function Install-Remote {
+    param([string]$SudoPass)
+
+    $opp = @{ left='right'; right='left'; top='bottom'; bottom='top' }[$script:ResolvedDirection]
+
+    Write-Sub "上传 5 个 patch 文件..."
+    foreach ($pair in @(
+        @('uinput.rs',                  '/tmp/lan-mouse-patches-uinput.rs'),
+        @('lib.rs',                     '/tmp/lan-mouse-patches-lib.rs'),
+        @('error.rs',                   '/tmp/lan-mouse-patches-error.rs'),
+        @('input-emulation-Cargo.toml', '/tmp/lan-mouse-patches-ie-Cargo.toml'),
+        @('root-Cargo.toml',            '/tmp/lan-mouse-patches-root-Cargo.toml'))) {
+        $local  = Join-Path $PatchDir $pair[0]
+        $remote = $pair[1]
+        Copy-ToRemote -Local $local -Remote $remote
+    }
+
+    Write-Sub "上传 UOS config.toml..."
+    $uosCfg = @"
+# generated by connect.ps1
+release_bind = ["KeyRightCtrl","KeyRightalt"]
+port = $($script:ResolvedPort)
+
+[$opp]
+hostname = "win-host"
+ips = ["$($script:ResolvedWinHostIp)"]
+port = $($script:ResolvedPort)
+"@
+    $tmpCfg = Join-Path $env:TEMP 'lan-mouse-uos-config.toml'
+    [System.IO.File]::WriteAllText($tmpCfg, $uosCfg, [System.Text.UTF8Encoding]::new($false))
+    Copy-ToRemote -Local $tmpCfg -Remote '/tmp/lan-mouse-config.toml'
+
+    Write-Sub "上传 install.sh / install-user.sh..."
+    $rootSh = @'
+#!/bin/bash
+set -eu
+PROXY="http://192.168.137.1:10808"
+TARGET_USER="${SUDO_USER:-$(logname 2>/dev/null || echo unknown)}"
+USER_HOME=$(getent passwd "$TARGET_USER" | cut -d: -f6)
+[ -n "$USER_HOME" ] || { echo "cannot resolve home dir for $TARGET_USER"; exit 1; }
+
+echo "[1/8] fix WiFi powersave + DNS"
+ACTIVE_DEV=$(nmcli -t -f DEVICE,STATE d 2>/dev/null | awk -F: '$2=="connected"{print $1; exit}')
+ACTIVE_CONN=$(nmcli -t -f NAME c show --active 2>/dev/null | head -1)
+if [ -n "$ACTIVE_CONN" ]; then
+    nmcli connection modify "$ACTIVE_CONN" 802-11-wireless.powersave 2 2>/dev/null || true
+    nmcli connection modify "$ACTIVE_CONN" 802-11-wireless.wake-on-wlan ignore 2>/dev/null || true
+    nmcli connection modify "$ACTIVE_CONN" ipv4.dns "119.29.29.29 223.5.5.5 8.8.8.8" 2>/dev/null || true
+    nmcli connection modify "$ACTIVE_CONN" ipv4.ignore-auto-dns yes 2>/dev/null || true
+    [ -n "$ACTIVE_DEV" ] && nmcli device reapply "$ACTIVE_DEV" 2>/dev/null || true
+fi
+mkdir -p /etc/NetworkManager/conf.d
+printf '[connection]\nwifi.powersave = 2\n' > /etc/NetworkManager/conf.d/wifi-powersave-off.conf
+
+echo "[2/8] /dev/uinput perms (input group, mode 660)"
+cat > /etc/udev/rules.d/99-uinput-input-group.rules <<'RULE'
+KERNEL=="uinput", GROUP="input", MODE="0660"
+RULE
+udevadm control --reload-rules 2>/dev/null || true
+chgrp input /dev/uinput 2>/dev/null || true
+chmod 660 /dev/uinput 2>/dev/null || true
+id -nG "$TARGET_USER" | tr ' ' '\n' | grep -qx input || usermod -aG input "$TARGET_USER"
+
+echo "[3/8] apt deps (libx11-dev libxtst-dev — may fail on UOS due to system pkg conflicts, ignore)"
+DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libx11-dev libxtst-dev 2>&1 | tail -3 || true
+
+echo "[4-8/8] handing off to user-side install"
+chown "$TARGET_USER":"$TARGET_USER" /tmp/install-user.sh
+chmod +x /tmp/install-user.sh
+sudo -u "$TARGET_USER" -H bash /tmp/install-user.sh
+'@
+    $userSh = @'
+#!/bin/bash
+set -eu
+PROXY="http://192.168.137.1:10808"
+export HTTP_PROXY="$PROXY" HTTPS_PROXY="$PROXY" http_proxy="$PROXY" https_proxy="$PROXY"
+
+echo "[4/8] Rust toolchain"
+if [ ! -x "$HOME/.cargo/bin/cargo" ]; then
+    curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs -o /tmp/rustup-init.sh
+    chmod +x /tmp/rustup-init.sh
+    RUSTUP_DIST_SERVER=https://rsproxy.cn RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup \
+        bash /tmp/rustup-init.sh -y --default-toolchain stable --profile minimal --no-modify-path
+fi
+. "$HOME/.cargo/env"
+
+echo "[5/8] cargo proxy + crates.io mirror"
+mkdir -p "$HOME/.cargo"
+cat > "$HOME/.cargo/config.toml" <<EOF
+[http]
+proxy = "$PROXY"
+[https]
+proxy = "$PROXY"
+[net]
+git-fetch-with-cli = true
+[source.crates-io]
+replace-with = "rsproxy-sparse"
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+EOF
+
+echo "[6/8] clone lan-mouse v0.10.0 + apply patches"
+mkdir -p "$HOME/src"
+cd "$HOME/src"
+[ -d lan-mouse ] || git clone --depth 1 --branch v0.10.0 https://github.com/feschber/lan-mouse.git
+cp /tmp/lan-mouse-patches-uinput.rs        lan-mouse/input-emulation/src/uinput.rs
+cp /tmp/lan-mouse-patches-lib.rs           lan-mouse/input-emulation/src/lib.rs
+cp /tmp/lan-mouse-patches-error.rs         lan-mouse/input-emulation/src/error.rs
+cp /tmp/lan-mouse-patches-ie-Cargo.toml    lan-mouse/input-emulation/Cargo.toml
+cp /tmp/lan-mouse-patches-root-Cargo.toml  lan-mouse/Cargo.toml
+
+echo "[7/8] cargo install (1-3 minutes on first build)"
+cd lan-mouse
+cargo install --locked --path . --no-default-features --features uinput_emulation --force
+
+echo "[8/8] deploy uos config"
+mkdir -p "$HOME/.config/lan-mouse"
+cp /tmp/lan-mouse-config.toml "$HOME/.config/lan-mouse/config.toml"
+
+echo "BUILD_DONE"
+ls -la "$HOME/.cargo/bin/lan-mouse"
+'@
+    $tmpRoot = Join-Path $env:TEMP 'lan-mouse-install.sh'
+    $tmpUser = Join-Path $env:TEMP 'lan-mouse-install-user.sh'
+    [System.IO.File]::WriteAllText($tmpRoot, $rootSh, [System.Text.UTF8Encoding]::new($false))
+    [System.IO.File]::WriteAllText($tmpUser, $userSh, [System.Text.UTF8Encoding]::new($false))
+    Copy-ToRemote -Local $tmpRoot -Remote '/tmp/install.sh'
+    Copy-ToRemote -Local $tmpUser -Remote '/tmp/install-user.sh'
+
+    Write-Sub "转 LF + 设置可执行权限"
+    Invoke-Ssh "sed -i 's/\r$//' /tmp/install.sh /tmp/install-user.sh; chmod +x /tmp/install.sh /tmp/install-user.sh" | Out-Null
+
+    Write-Step "执行远端安装（约 2-4 分钟）"
+    $combined = $SudoPass + "`n"
+    $combined | & ssh.exe $script:ResolvedTarget "sudo -S -p '' bash /tmp/install.sh" 2>&1 | ForEach-Object {
+        if     ($_ -match 'BUILD_DONE')             { Write-OK "编译完成，binary 已就位" }
+        elseif ($_ -match '^\[\d/8\]')              { Write-Sub $_ }
+        elseif ($_ -match 'Compiling lan-mouse ')   { Write-Sub "    -> 链接最终 binary..." }
+        elseif ($_ -match 'error\[E|error: failed') { Write-Err2 $_ }
+        elseif ($_ -match '验证成功')                { } # silence sudo cn-locale prompt confirmation
+        else { Write-Sub $_ }
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Write-Err2 "远端安装失败（exit $LASTEXITCODE）"
+        exit 1
+    }
+}
+
+# ---------- start remote daemon ----------
+function Start-RemoteClipsync {
+    if ($NoClipsync) { return }
+    Write-Step "启动远端 clipsync (listen :$($script:ResolvedClipsyncPort))"
+    $port = $script:ResolvedClipsyncPort
+    # 用 here-string + bash -s 方式喂脚本，避免 ssh 单行命令对 ; & 的 quote bug
+    # WAYLAND_DISPLAY 必须显式 export — ssh non-interactive shell 不继承 wayland session
+    $script = @"
+pkill -f 'cargo/bin/clipsync' 2>/dev/null || true
+sleep 1
+rm -f /tmp/clipsync.log
+if [ ! -x "`$HOME/.cargo/bin/clipsync" ]; then
+    echo NOT_INSTALLED
+    exit 0
+fi
+export WAYLAND_DISPLAY=wayland-0
+export XDG_RUNTIME_DIR=/run/user/1000
+export DISPLAY=:0
+export XAUTHORITY=`$HOME/.Xauthority
+nohup "`$HOME/.cargo/bin/clipsync" --listen 0.0.0.0:$port > /tmp/clipsync.log 2>&1 < /dev/null &
+disown
+sleep 1
+pgrep -f cargo/bin/clipsync >/dev/null && echo OK || echo FAIL
+"@
+    $out = Invoke-Ssh "bash -s" -Stdin $script
+    $joined = ($out -join "`n")
+    if ($joined -match 'NOT_INSTALLED') {
+        Write-Warn2 "远端无 clipsync — 跑 .\connect.ps1 -Force 让远端自动安装"
+    } elseif ($joined -match 'OK') {
+        Write-OK "远端 clipsync 已 listen :$port"
+    } else {
+        Write-Warn2 "远端 clipsync 状态不明: $joined"
+    }
+}
+
+function Start-RemoteDaemon {
+    Write-Step "启动远端 lan-mouse daemon"
+    $cmd = @'
+pkill -f "cargo/bin/lan-mouse -d" 2>/dev/null || true
+sleep 1
+rm -f /tmp/lan-mouse.log
+nohup "$HOME/.cargo/bin/lan-mouse" -d > /tmp/lan-mouse.log 2>&1 < /dev/null &
+disown
+sleep 2
+tail -10 /tmp/lan-mouse.log
+'@
+    $out = Invoke-Ssh "bash -s" -Stdin $cmd
+    $joined = ($out -join "`n")
+    if ($joined -match 'using emulation backend: uinput') {
+        Write-OK "uinput backend 启动"
+    } elseif ($joined -match 'using emulation backend:') {
+        Write-Warn2 "启动了，但未使用 uinput backend"
+        Write-Sub $joined
+    } else {
+        Write-Warn2 "daemon 状态待确认，日志:"
+        Write-Sub $joined
+    }
+}
+function Activate-Remote {
+    Write-Step "激活远端 client 0"
+    # 用 stdin 喂 cli 命令；远端 timeout 4s 防卡死；ssh 自身 8s connect timeout
+    $script = @"
+printf "activate 0\nlist\n" | timeout 4 "`$HOME/.cargo/bin/lan-mouse" -f cli 2>&1
+"@
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'ssh.exe'
+    $argList = @('-o','ConnectTimeout=8','-o','LogLevel=ERROR','-o','ServerAliveInterval=3','-o','ServerAliveCountMax=2',$script:ResolvedTarget,'bash -s')
+    $psi.Arguments = ($argList | ForEach-Object {
+        if ($_ -match '[\s"]') { '"' + ($_ -replace '"','\"') + '"' } else { $_ }
+    }) -join ' '
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $proc.StandardInput.Write($script)
+    $proc.StandardInput.Close()
+    if (-not $proc.WaitForExit(15000)) {
+        try { $proc.Kill() } catch {}
+        Write-Warn2 "激活超时（15s），跳过 — 远端 daemon 或 SSH 不响应"
+        return
+    }
+    $out = $proc.StandardOutput.ReadToEnd() + $proc.StandardError.ReadToEnd()
+    if ($out -match 'active: true') {
+        Write-OK "远端 client 0 已激活"
+    } else {
+        Write-Warn2 "激活状态待确认: $out"
+    }
+}
+
+# ---------- local (Windows) daemon ----------
+function Ensure-LocalConfig {
+    $localCfg = @"
+# generated by connect.ps1
+release_bind = ["KeyRightCtrl","KeyRightalt"]
+port = $($script:ResolvedPort)
+
+[$($script:ResolvedDirection)]
+hostname = "$($script:ResolvedHostname)"
+ips = ["$($script:ResolvedTarget -replace '^.*@','' -replace ':.*$','')"]
+port = $($script:ResolvedPort)
+"@
+    [System.IO.File]::WriteAllText($WinCfg, $localCfg, [System.Text.UTF8Encoding]::new($false))
+    Write-Sub "Windows config: $WinCfg"
+}
+function Start-LocalDaemon {
+    if (-not (Test-Path $WinExe)) {
+        Write-Err2 "找不到 Windows lan-mouse: $WinExe"
+        Write-Sub "下载并解压 lan-mouse-windows.zip 到 $WinBinDir"
+        exit 1
+    }
+    Ensure-LocalConfig
+    Write-Step "启动 Windows daemon"
+    Get-Process lan-mouse -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 500
+    $stdoutLog = Join-Path $ScriptDir 'stdout.log'
+    $stderrLog = Join-Path $ScriptDir 'stderr.log'
+    Remove-Item $stdoutLog,$stderrLog -ErrorAction SilentlyContinue
+    # patched binary 识别此环境变量：鼠标必须在屏幕边界停留 N 毫秒才越界（防误触）
+    $env:LAN_MOUSE_DWELL_MS = "$($script:ResolvedDwellMs)"
+    # 让 lan-mouse 把 input_capture 的 dwell trace 写到 stderr.log（方便远程诊断）
+    $env:RUST_LOG = "info,input_capture=debug"
+    # demo 模式：indicator 启动后一直显示在屏幕左中，进度条循环动画，远程截图查看
+    if ($DemoIndicator) { $env:LAN_MOUSE_INDICATOR_DEMO = "1" } else { Remove-Item Env:LAN_MOUSE_INDICATOR_DEMO -ErrorAction SilentlyContinue }
+    Write-Sub ("dwell time = " + $script:ResolvedDwellMs + " ms  (RUST_LOG=info,input_capture=debug)")
+    if ($DemoIndicator) { Write-Sub "INDICATOR DEMO MODE: 永久显示在屏幕左中，进度条 1.5s 循环" }
+    Start-Process -FilePath $WinExe `
+                  -ArgumentList @('-d','-c',$WinCfg) `
+                  -WindowStyle Hidden `
+                  -RedirectStandardOutput $stdoutLog `
+                  -RedirectStandardError  $stderrLog | Out-Null
+    Start-Sleep -Seconds 2
+    if (Get-Process lan-mouse -ErrorAction SilentlyContinue) {
+        Write-OK "Windows daemon 启动"
+    } else {
+        Write-Err2 "Windows daemon 启动失败，看 $stderrLog"
+        exit 1
+    }
+}
+function Activate-Local {
+    Write-Step "激活 Windows client 0"
+    "activate 0`nlist" | & $WinExe -f cli -c $WinCfg 2>&1 | Out-Null
+    Write-OK "Windows client 0 已激活"
+}
+
+function Start-LocalClipsync {
+    if ($NoClipsync) { return }
+    $exe = Join-Path $WinBinDir 'clipsync.exe'
+    if (-not (Test-Path $exe)) {
+        Write-Warn2 "找不到 clipsync.exe — 已跳过"
+        return
+    }
+    Write-Step "启动 Windows clipsync (connect $($script:ResolvedClipsyncTarget):$($script:ResolvedClipsyncPort))"
+    Get-Process clipsync -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 300
+    $stdoutLog = Join-Path $ScriptDir 'clipsync-stdout.log'
+    $stderrLog = Join-Path $ScriptDir 'clipsync-stderr.log'
+    Remove-Item $stdoutLog,$stderrLog -ErrorAction SilentlyContinue
+    Start-Process -FilePath $exe `
+                  -ArgumentList @(
+                      '--connect', "$($script:ResolvedClipsyncTarget):$($script:ResolvedClipsyncPort)"
+                  ) `
+                  -WindowStyle Hidden `
+                  -RedirectStandardOutput $stdoutLog `
+                  -RedirectStandardError  $stderrLog | Out-Null
+    Start-Sleep -Milliseconds 500
+    if (Get-Process clipsync -ErrorAction SilentlyContinue) {
+        Write-OK "Windows clipsync 启动 (双向自动同步剪贴板文本)"
+    } else {
+        Write-Warn2 "Windows clipsync 启动失败，看 $stderrLog"
+    }
+}
+
+# ---------- stop ----------
+function Stop-AllDaemons {
+    Write-Step "停止两端 daemon (lan-mouse + clipsync)"
+    Invoke-Ssh "pkill -f 'cargo/bin/lan-mouse -d' 2>/dev/null; pkill -f 'cargo/bin/clipsync' 2>/dev/null; true" | Out-Null
+    Get-Process lan-mouse,clipsync -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Write-OK "已停止"
+}
+
+# ============================== MAIN ==============================
+$existing = Load-Config
+
+# 决定是否进向导：显式 -Setup 或 没 config 文件且没传参覆盖
+$noConfig = ($null -eq $existing)
+$hasOverride = $PSBoundParameters.ContainsKey('Target') -or $PSBoundParameters.ContainsKey('Direction') -or $PSBoundParameters.ContainsKey('WinHostIp')
+$enterWizard = $Setup -or ($noConfig -and -not $hasOverride)
+
+if ($enterWizard) {
+    $cfg = Run-SetupWizard $existing
+} else {
+    $cfg = if ($existing) { $existing } else {
+        # 用户传了部分参数但没 config，构造最小 cfg + 用默认值补全
+        [PSCustomObject]@{
+            Target    = if ($Target)    { $Target }    else { 'uos@192.168.137.27' }
+            Direction = if ($Direction) { $Direction } else { 'left' }
+            WinHostIp = if ($WinHostIp) { $WinHostIp } else { '192.168.137.1' }
+            Port      = if ($Port)      { $Port }      else { 4242 }
+            Hostname  = if ($Hostname)  { $Hostname }  else { 'uos' }
+        }
+    }
+}
+
+# CLI 参数覆盖 cfg
+if ($PSBoundParameters.ContainsKey('Target'))    { $cfg.Target = $Target }
+if ($PSBoundParameters.ContainsKey('Direction')) { $cfg.Direction = $Direction }
+if ($PSBoundParameters.ContainsKey('WinHostIp')) { $cfg.WinHostIp = $WinHostIp }
+if ($PSBoundParameters.ContainsKey('Port'))      { $cfg.Port = $Port }
+if ($PSBoundParameters.ContainsKey('Hostname'))  { $cfg.Hostname = $Hostname }
+if ($PSBoundParameters.ContainsKey('DwellMs'))   {
+    if ($cfg.PSObject.Properties.Name -contains 'DwellMs') { $cfg.DwellMs = $DwellMs }
+    else { $cfg | Add-Member -NotePropertyName DwellMs -NotePropertyValue $DwellMs -Force }
+}
+
+# 落到 script-scope 变量供函数引用
+$script:ResolvedTarget    = $cfg.Target
+$script:ResolvedDirection = $cfg.Direction
+$script:ResolvedWinHostIp = $cfg.WinHostIp
+$script:ResolvedPort      = [int]$cfg.Port
+$script:ResolvedHostname  = $cfg.Hostname
+$script:ResolvedDwellMs   = if ($cfg.PSObject.Properties.Name -contains 'DwellMs') { [int]$cfg.DwellMs } else { 0 }
+$script:ResolvedClipsyncPort = if ($PSBoundParameters.ContainsKey('ClipsyncPort')) { $ClipsyncPort } else { 4243 }
+$script:ResolvedClipsyncTarget = ($cfg.Target -replace '^.*@','' -replace ':.*$','')
+
+Write-Host ""
+Write-Host ("  Lan Mouse 一键连接   target=" + $script:ResolvedTarget + "  direction=" + $script:ResolvedDirection + "  port=" + $script:ResolvedPort) -ForegroundColor White
+Write-Host ""
+
+if ($Stop) { Stop-AllDaemons; return }
+
+Write-Step "[1/4] 测试 SSH 连通性"
+if (-not (Test-Ssh)) {
+    Write-Err2 "SSH 连接失败到 $($script:ResolvedTarget)"
+    Write-Sub "确认对方在线、网络通"
+    Write-Sub ("确认已设公钥免密: ssh-copy-id " + $script:ResolvedTarget)
+    Write-Sub ("（需要重新配置可加 -Setup 或删除 $ConfigPath）")
+    exit 1
+}
+Write-OK "SSH 通"
+
+Write-Step "[2/4] 探测远端状态"
+$state = Probe-Remote
+$verSuffix = if ($state.LAN_VER) { "  (" + $state.LAN_VER + ")" } else { "" }
+Write-Sub ("架构          : " + $state.ARCH)
+Write-Sub ("lan-mouse     : " + $state.INSTALLED + $verSuffix)
+Write-Sub ("daemon 运行   : " + $state.RUNNING)
+Write-Sub ("/dev/uinput   : " + $state.UINPUT_PERMS + "  writable=" + $state.UINPUT_OK)
+Write-Sub ("WiFi powersave: " + $state.NM_POWERSAVE)
+
+$needInstall = ($state.INSTALLED -ne 'yes') -or $Force
+$needPerms   = ($state.UINPUT_OK -ne 'yes')
+
+if ($needInstall) {
+    Write-Step "[3/4] 远端首次安装"
+    $secure = Read-Host -Prompt "    远端 sudo 密码 ($($script:ResolvedTarget))" -AsSecureString
+    $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+    $pass = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
+    [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+    Install-Remote -SudoPass $pass
+    Start-RemoteDaemon
+    Activate-Remote
+    Start-RemoteClipsync
+} elseif ($state.RUNNING -ne 'yes') {
+    if ($needPerms) {
+        Write-Step "[3a/4] 修复 /dev/uinput 权限（需要 sudo）"
+        $secure = Read-Host -Prompt "    远端 sudo 密码" -AsSecureString
+        $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+        $pass = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
+        [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+        $fix = "chgrp input /dev/uinput; chmod 660 /dev/uinput; echo done"
+        ($pass + "`n") | & ssh.exe $script:ResolvedTarget "sudo -S -p '' bash -c '$fix'" 2>&1 | Out-Null
+        Write-OK "uinput 权限已修"
+    }
+    Write-Step "[3/4] 远端已装但未运行 — 启动 daemon"
+    Start-RemoteDaemon
+    Activate-Remote
+    Start-RemoteClipsync
+} else {
+    Write-Step "[3/4] 远端 daemon 已在运行 — 重新激活 + 重启 clipsync"
+    Activate-Remote
+    Start-RemoteClipsync
+}
+
+Write-Step ("[4/4] Windows 端  dwell=" + $script:ResolvedDwellMs + "ms")
+# 总是重启 Windows daemon —— 因为 dwell 通过 LAN_MOUSE_DWELL_MS 环境变量传入，
+# 旧进程不会响应新值。重启代价 ~2 秒断流，可接受。
+Start-LocalDaemon
+Activate-Local
+Start-LocalClipsync
+
+Write-Host ""
+Write-Host "  ====================  OK  ====================" -ForegroundColor Green
+Write-Host ("  鼠标向 " + $script:ResolvedDirection + " 滑出 Windows 屏幕边缘 -> 越界到远端")
+Write-Host  "  释放快捷键: 右 Ctrl + 右 Alt 同时按"
+Write-Host  "  停止两端  : .\connect.ps1 -Stop"
+Write-Host  "  改方向    : .\connect.ps1 -Setup        (重跑向导)"
+Write-Host  "                .\connect.ps1 -Direction right  (一次性覆盖)"
+Write-Host  "  强制重装  : .\connect.ps1 -Force"
+Write-Host ""
