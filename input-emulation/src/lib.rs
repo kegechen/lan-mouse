@@ -23,6 +23,9 @@ mod xdg_desktop_portal;
 #[cfg(all(unix, feature = "libei", not(target_os = "macos")))]
 mod libei;
 
+#[cfg(all(unix, feature = "uinput", not(target_os = "macos")))]
+mod uinput;
+
 #[cfg(target_os = "macos")]
 mod macos;
 
@@ -34,6 +37,8 @@ pub type EmulationHandle = u64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Backend {
+    #[cfg(all(unix, feature = "uinput", not(target_os = "macos")))]
+    Uinput,
     #[cfg(all(unix, feature = "wlroots", not(target_os = "macos")))]
     Wlroots,
     #[cfg(all(unix, feature = "libei", not(target_os = "macos")))]
@@ -52,6 +57,8 @@ pub enum Backend {
 impl Display for Backend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            #[cfg(all(unix, feature = "uinput", not(target_os = "macos")))]
+            Backend::Uinput => write!(f, "uinput"),
             #[cfg(all(unix, feature = "wlroots", not(target_os = "macos")))]
             Backend::Wlroots => write!(f, "wlroots"),
             #[cfg(all(unix, feature = "libei", not(target_os = "macos")))]
@@ -78,6 +85,8 @@ pub struct InputEmulation {
 impl InputEmulation {
     async fn with_backend(backend: Backend) -> Result<InputEmulation, EmulationCreationError> {
         let emulation: Box<dyn Emulation> = match backend {
+            #[cfg(all(unix, feature = "uinput", not(target_os = "macos")))]
+            Backend::Uinput => Box::new(uinput::UinputEmulation::new()?),
             #[cfg(all(unix, feature = "wlroots", not(target_os = "macos")))]
             Backend::Wlroots => Box::new(wlroots::WlrootsEmulation::new()?),
             #[cfg(all(unix, feature = "libei", not(target_os = "macos")))]
@@ -109,6 +118,8 @@ impl InputEmulation {
         }
 
         for backend in [
+            #[cfg(all(unix, feature = "uinput", not(target_os = "macos")))]
+            Backend::Uinput,
             #[cfg(all(unix, feature = "wlroots", not(target_os = "macos")))]
             Backend::Wlroots,
             #[cfg(all(unix, feature = "libei", not(target_os = "macos")))]

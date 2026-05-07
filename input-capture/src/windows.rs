@@ -14,22 +14,29 @@ use std::task::ready;
 use std::{pin::Pin, thread};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{FALSE, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, FALSE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayDevicesW, EnumDisplaySettingsW, DEVMODEW, DISPLAY_DEVICEW,
-    DISPLAY_DEVICE_ATTACHED_TO_DESKTOP, ENUM_CURRENT_SETTINGS,
+    BeginPaint, BeginPath, BitBlt, CloseFigure, CreateCompatibleBitmap, CreateCompatibleDC,
+    CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, EndPaint, EndPath, EnumDisplayDevicesW,
+    EnumDisplaySettingsW, FillRect, InvalidateRect, LineTo, MoveToEx, Polygon, SelectClipPath,
+    SelectObject, UpdateWindow, DEVMODEW, DISPLAY_DEVICEW, DISPLAY_DEVICE_ATTACHED_TO_DESKTOP,
+    ENUM_CURRENT_SETTINGS, HBRUSH, HGDIOBJ, HPEN, PAINTSTRUCT, PS_SOLID, RGN_COPY, SRCCOPY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreateWindowExW, DispatchMessageW, GetMessageW, PostThreadMessageW,
-    RegisterClassW, SetWindowsHookExW, TranslateMessage, EDD_GET_DEVICE_INTERFACE_NAME, HHOOK,
-    HMENU, HOOKPROC, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT, WH_KEYBOARD_LL,
-    WH_MOUSE_LL, WINDOW_STYLE, WM_DISPLAYCHANGE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW,
-    WNDPROC,
+    CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect,
+    GetCursorPos, GetMessageW, KillTimer, LoadCursorW, PostThreadMessageW, RegisterClassW,
+    SetLayeredWindowAttributes, SetTimer, SetWindowPos, SetWindowsHookExW, ShowCursor,
+    ShowWindow, TranslateMessage, EDD_GET_DEVICE_INTERFACE_NAME, HHOOK, HMENU, HOOKPROC,
+    HWND_TOPMOST, IDC_ARROW, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LWA_ALPHA, LWA_COLORKEY, MSG,
+    MSLLHOOKSTRUCT, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, WH_KEYBOARD_LL, WH_MOUSE_LL,
+    WINDOW_STYLE, WM_DISPLAYCHANGE,
+    WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
+    WM_SYSKEYUP, WM_TIMER, WM_USER, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WNDPROC,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 use input_event::{
@@ -113,6 +120,303 @@ unsafe fn get_event_tid() -> Option<u32> {
 }
 
 static mut ENTRY_POINT: (i32, i32) = (0, 0);
+
+// === lan-mouse dwell-time patch (sticky corners) ===
+// 鼠标必须在屏幕边界停留 N 毫秒才会越界，避免误触。
+// 通过环境变量 LAN_MOUSE_DWELL_MS 配置（默认 0 = 关闭，恢复原行为）。
+// 实现机制：第一次撞边界时设置 PENDING_BARRIER + Win32 SetTimer，鼠标
+// 离开边界时取消 timer；timer fire 时（即使鼠标静止）window_proc 用
+// GetCursorPos 复查光标仍贴边即激活。
+const DWELL_TIMER_ID: usize = 0xD05E;
+// 三元组：(barrier 方向, 入口点 clamp 到 display 内, dwell 起始时间)
+// 起始时间用于 mouse-motion 路径激活（绕开 WM_TIMER 在 message queue 里被
+// mouse 输入消息饿死的问题）。
+static mut PENDING_BARRIER: Option<(Position, (i32, i32), std::time::Instant)> = None;
+static mut MSG_HWND: HWND = HWND(std::ptr::null_mut());
+
+fn dwell_ms() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CACHED: AtomicU64 = AtomicU64::new(u64::MAX);
+    let v = CACHED.load(Ordering::Relaxed);
+    if v != u64::MAX {
+        return v;
+    }
+    let parsed = std::env::var("LAN_MOUSE_DWELL_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    CACHED.store(parsed, Ordering::Relaxed);
+    parsed
+}
+
+/// returns the barrier (display edge) the point is touching, or None if interior
+fn at_barrier(point: (i32, i32), displays: &[RECT]) -> Option<Position> {
+    let display = displays.iter().find(|&d| is_within_dp_region(point, d))?;
+    let (x, y) = point;
+    if x <= display.left { return Some(Position::Left); }
+    if x >= display.right - 1 { return Some(Position::Right); }
+    if y <= display.top { return Some(Position::Top); }
+    if y >= display.bottom - 1 { return Some(Position::Bottom); }
+    None
+}
+
+// === Win11-style sticky-edge visual indicator ===
+// 半透明小条贴在屏幕边缘，dwell 期间填充进度。
+const INDICATOR_TIMER_ID: usize = 0xD06E;
+const INDICATOR_REFRESH_MS: u32 = 16; // ~60fps
+static mut INDICATOR_HWND: HWND = HWND(std::ptr::null_mut());
+
+// 当前显示的箭头方向（paint 根据 pos 画对应 V 形）
+static mut INDICATOR_POS: Position = Position::Left;
+// 隐藏 Windows 系统光标 — 配对 ShowCursor 才能恢复（计数器）
+static mut CURSOR_HIDDEN: bool = false;
+
+unsafe fn hide_cursor() {
+    if !CURSOR_HIDDEN {
+        let _ = ShowCursor(false);
+        CURSOR_HIDDEN = true;
+    }
+}
+
+unsafe fn restore_cursor() {
+    if CURSOR_HIDDEN {
+        let _ = ShowCursor(true);
+        CURSOR_HIDDEN = false;
+    }
+}
+
+unsafe fn show_indicator(pos: Position, cursor: (i32, i32), displays: &[RECT]) {
+    if INDICATOR_HWND.0.is_null() {
+        return;
+    }
+    let display = match displays.iter().find(|&d| is_within_dp_region(cursor, d)) {
+        Some(d) => *d,
+        None => return,
+    };
+    // V 形箭头尺寸：水平方向（left/right）40×120，垂直方向（top/bottom）120×40
+    let (x, y, w, h) = match pos {
+        Position::Left => (display.left, cursor.1 - 60, 40, 120),
+        Position::Right => (display.right - 40, cursor.1 - 60, 40, 120),
+        Position::Top => (cursor.0 - 60, display.top, 120, 40),
+        Position::Bottom => (cursor.0 - 60, display.bottom - 40, 120, 40),
+    };
+    INDICATOR_POS = pos;
+    log::info!("show_indicator: pos={pos:?} rect=({x},{y},{w}x{h})");
+    let _ = SetWindowPos(
+        INDICATOR_HWND,
+        HWND_TOPMOST,
+        x,
+        y,
+        w,
+        h,
+        SWP_NOACTIVATE | SWP_SHOWWINDOW,
+    );
+    let _ = SetTimer(INDICATOR_HWND, INDICATOR_TIMER_ID, INDICATOR_REFRESH_MS, None);
+    let _ = InvalidateRect(INDICATOR_HWND, None, FALSE);
+    let _ = UpdateWindow(INDICATOR_HWND);
+    // 隐藏 Windows 系统光标 — WC3 边缘滚屏的视觉感（demo 模式不影响光标，避免长期隐藏）
+    if !demo_mode() {
+        hide_cursor();
+    }
+}
+
+fn demo_mode() -> bool {
+    use std::sync::atomic::{AtomicI8, Ordering};
+    static CACHED: AtomicI8 = AtomicI8::new(-1);
+    let v = CACHED.load(Ordering::Relaxed);
+    if v != -1 {
+        return v == 1;
+    }
+    let parsed = std::env::var("LAN_MOUSE_INDICATOR_DEMO")
+        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    CACHED.store(if parsed { 1 } else { 0 }, Ordering::Relaxed);
+    parsed
+}
+
+unsafe fn hide_indicator() {
+    if INDICATOR_HWND.0.is_null() {
+        return;
+    }
+    // 注：cursor 不在这里恢复 — 激活路径希望保持隐藏直到 Release，
+    // 取消路径由 cancel_pending() 单独调 restore_cursor()。
+    if demo_mode() {
+        return; // demo 模式 indicator window 永久显示
+    }
+    let _ = KillTimer(INDICATOR_HWND, INDICATOR_TIMER_ID);
+    let _ = ShowWindow(INDICATOR_HWND, SW_HIDE);
+}
+
+unsafe extern "system" fn indicator_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        x if x == WM_PAINT => {
+            let mut ps: PAINTSTRUCT = std::mem::zeroed();
+            let screen_dc = BeginPaint(hwnd, &mut ps);
+            let mut rc: RECT = std::mem::zeroed();
+            let _ = GetClientRect(hwnd, &mut rc);
+            let w = rc.right - rc.left;
+            let h = rc.bottom - rc.top;
+            // double buffer：在内存 DC 完整画好再 BitBlt 到屏幕，消除闪烁
+            let hdc = CreateCompatibleDC(screen_dc);
+            let mem_bmp = CreateCompatibleBitmap(screen_dc, w, h);
+            let old_mem_bmp = SelectObject(hdc, HGDIOBJ(mem_bmp.0));
+            // erase 内存 DC 到 colorkey magenta（V 外像素将被 layered 透明化）
+            let key_brush = CreateSolidBrush(COLORREF(0x00FF00FF));
+            let _ = FillRect(hdc, &rc, key_brush);
+            let _ = DeleteObject(HGDIOBJ(key_brush.0));
+
+            // 进度 0.0..1.0
+            let progress = if demo_mode() {
+                static DEMO_START: std::sync::OnceLock<std::time::Instant> =
+                    std::sync::OnceLock::new();
+                let start = *DEMO_START.get_or_init(std::time::Instant::now);
+                (start.elapsed().as_millis() as f64 / 1500.0) % 1.0
+            } else if let Some((_, _, started)) = PENDING_BARRIER {
+                let total = dwell_ms().max(1) as f64;
+                (started.elapsed().as_millis() as f64 / total).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+
+            let pos = INDICATOR_POS;
+
+            // V 形箭头三个 vertex（尖端指向 pos 方向）
+            let inset = 4i32;
+            let pts = match pos {
+                Position::Left => [
+                    POINT { x: w - inset, y: inset },
+                    POINT { x: inset, y: h / 2 },
+                    POINT { x: w - inset, y: h - inset },
+                ],
+                Position::Right => [
+                    POINT { x: inset, y: inset },
+                    POINT { x: w - inset, y: h / 2 },
+                    POINT { x: inset, y: h - inset },
+                ],
+                Position::Top => [
+                    POINT { x: inset, y: h - inset },
+                    POINT { x: w / 2, y: inset },
+                    POINT { x: w - inset, y: h - inset },
+                ],
+                Position::Bottom => [
+                    POINT { x: inset, y: inset },
+                    POINT { x: w / 2, y: h - inset },
+                    POINT { x: w - inset, y: inset },
+                ],
+            };
+
+            // 颜色: 浅蓝轮廓 + 亮蓝进度（蓝色 = "前进/方向"感）
+            let bg_color = COLORREF(0x00FFAA78); // BGR = 浅蓝 RGB(120,170,255)
+            let fg_color = COLORREF(0x00FF6E28); // BGR = 亮蓝 RGB(40,110,255)
+
+            // 1) 画整 V 形浅蓝（Polygon 自动填充闭合多边形）
+            let bg_pen: HPEN = CreatePen(PS_SOLID, 2, bg_color);
+            let bg_brush: HBRUSH = CreateSolidBrush(bg_color);
+            let old_pen = SelectObject(hdc, HGDIOBJ(bg_pen.0));
+            let old_brush = SelectObject(hdc, HGDIOBJ(bg_brush.0));
+            let _ = Polygon(hdc, &pts);
+
+            // 2) 设 clip path 到 V 形
+            let _ = BeginPath(hdc);
+            let _ = MoveToEx(hdc, pts[0].x, pts[0].y, None);
+            let _ = LineTo(hdc, pts[1].x, pts[1].y);
+            let _ = LineTo(hdc, pts[2].x, pts[2].y);
+            let _ = CloseFigure(hdc);
+            let _ = EndPath(hdc);
+            let _ = SelectClipPath(hdc, RGN_COPY);
+
+            // 3) clip 内画亮蓝进度矩形（从尖端方向 fill）
+            let progress_rect = match pos {
+                Position::Left => RECT {
+                    left: 0, top: 0,
+                    right: (w as f64 * progress) as i32, bottom: h,
+                },
+                Position::Right => RECT {
+                    left: w - (w as f64 * progress) as i32, top: 0,
+                    right: w, bottom: h,
+                },
+                Position::Top => RECT {
+                    left: 0, top: 0,
+                    right: w, bottom: (h as f64 * progress) as i32,
+                },
+                Position::Bottom => RECT {
+                    left: 0, top: h - (h as f64 * progress) as i32,
+                    right: w, bottom: h,
+                },
+            };
+            let fg_brush: HBRUSH = CreateSolidBrush(fg_color);
+            let _ = FillRect(hdc, &progress_rect, fg_brush);
+
+            // 4) 清 clip — 设全 client 矩形为新 clip path
+            let _ = BeginPath(hdc);
+            let _ = MoveToEx(hdc, 0, 0, None);
+            let _ = LineTo(hdc, w, 0);
+            let _ = LineTo(hdc, w, h);
+            let _ = LineTo(hdc, 0, h);
+            let _ = CloseFigure(hdc);
+            let _ = EndPath(hdc);
+            let _ = SelectClipPath(hdc, RGN_COPY);
+
+            SelectObject(hdc, old_pen);
+            SelectObject(hdc, old_brush);
+            let _ = DeleteObject(HGDIOBJ(bg_pen.0));
+            let _ = DeleteObject(HGDIOBJ(bg_brush.0));
+            let _ = DeleteObject(HGDIOBJ(fg_brush.0));
+            // double buffer：原子地把内存 DC 拷到屏幕
+            let _ = BitBlt(screen_dc, 0, 0, w, h, hdc, 0, 0, SRCCOPY);
+            SelectObject(hdc, old_mem_bmp);
+            let _ = DeleteObject(HGDIOBJ(mem_bmp.0));
+            let _ = DeleteDC(hdc);
+            let _ = EndPaint(hwnd, &ps);
+            return LRESULT(0);
+        }
+        x if x == WM_TIMER => {
+            if wparam.0 == INDICATOR_TIMER_ID {
+                let _ = InvalidateRect(hwnd, None, FALSE);
+                return LRESULT(0);
+            }
+        }
+        _ => {}
+    }
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+unsafe fn cancel_pending() {
+    if PENDING_BARRIER.take().is_some() {
+        let _ = KillTimer(MSG_HWND, DWELL_TIMER_ID);
+        hide_indicator();
+        restore_cursor(); // 取消 dwell 时恢复光标（用户拉回鼠标）
+    }
+}
+
+/// called from window_proc when WM_TIMER fires; cursor may be anywhere (incl. static)
+unsafe fn try_activate_pending() {
+    let Some((pos, entry, _)) = PENDING_BARRIER.take() else { return };
+    let mut cursor = POINT { x: 0, y: 0 };
+    if GetCursorPos(&mut cursor).is_err() {
+        return;
+    }
+    if at_barrier((cursor.x, cursor.y), get_display_regions()) != Some(pos) {
+        log::debug!("dwell timer fired but cursor no longer at {pos:?}");
+        return;
+    }
+    if !CLIENTS.contains(&pos) {
+        return;
+    }
+    if ACTIVE_CLIENT.is_some() {
+        return;
+    }
+    ACTIVE_CLIENT.replace(pos);
+    ENTRY_POINT = entry;
+    hide_indicator();
+    log::debug!("dwell satisfied (timer path) -> activate @ {pos:?}");
+    send_blocking(CaptureEvent::Begin);
+}
 
 fn to_mouse_event(wparam: WPARAM, lparam: LPARAM) -> Option<PointerEvent> {
     let mouse_low_level: MSLLHOOKSTRUCT = unsafe { *(lparam.0 as *const MSLLHOOKSTRUCT) };
@@ -275,25 +579,79 @@ unsafe fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
         return ret;
     }
 
-    /* check if a client was activated */
-    let Some(pos) = entered_barrier(prev_pos, curr_pos, get_display_regions()) else {
+    let displays = get_display_regions();
+    let dwell = dwell_ms();
+
+    // sticky-corners pending state: 鼠标已撞到 barrier 但 dwell 还没到
+    if let Some((pending_pos, entry, started)) = PENDING_BARRIER {
+        let still_at = at_barrier(curr_pos, displays) == Some(pending_pos);
+        if !still_at {
+            log::debug!("dwell cancelled (cursor left {pending_pos:?})");
+            cancel_pending();
+            // 继续走下面的 entered_barrier 逻辑（鼠标可能撞到别的 barrier）
+        } else {
+            // 仍贴边 — 鼠标 motion 路径自己检查 dwell 是否已过
+            // (因为 WM_TIMER 在 message queue 里优先级低于 mouse 输入，持续移动时 timer 被饿死)
+            if started.elapsed() >= std::time::Duration::from_millis(dwell) {
+                let _ = KillTimer(MSG_HWND, DWELL_TIMER_ID);
+                PENDING_BARRIER = None;
+                if CLIENTS.contains(&pending_pos) {
+                    ACTIVE_CLIENT.replace(pending_pos);
+                    ENTRY_POINT = entry;
+                    hide_indicator();
+                    log::debug!("dwell satisfied (motion path) -> activate @ {pending_pos:?}");
+                    send_blocking(CaptureEvent::Begin);
+                }
+                return ACTIVE_CLIENT.is_some();
+            }
+            // dwell 还没到，继续等
+            return false;
+        }
+    }
+
+    /* check if mouse crossed/touches a barrier
+     * dwell == 0：保持原行为 entered_barrier 严格越界检测
+     * dwell > 0：兜底 at_barrier(curr_pos) — 鼠标贴边即可触发，避免
+     *           LowLevelMouseProc 在某些 Win 版本拿到 post-clamp 坐标导致
+     *           "越界但 entered_barrier 不 fire" 的问题
+     */
+    let pos = if dwell == 0 {
+        entered_barrier(prev_pos, curr_pos, displays)
+    } else {
+        entered_barrier(prev_pos, curr_pos, displays)
+            .or_else(|| at_barrier(curr_pos, displays))
+    };
+    let Some(pos) = pos else {
         return ret;
     };
-
-    /* check if a client is registered for the barrier */
     if !CLIENTS.contains(&pos) {
         return ret;
     }
 
-    /* update active client and entry point */
-    ACTIVE_CLIENT.replace(pos);
-    ENTRY_POINT = clamp_to_display_bounds(prev_pos, curr_pos);
+    // 防御：at_barrier 兜底时 prev_pos 可能在屏幕外（pre-clamp 负坐标），
+    // clamp_to_display_bounds 用 prev 找 display，找不到会 unwrap panic。
+    let safe_prev = if displays.iter().any(|d| is_within_dp_region(prev_pos, d)) {
+        prev_pos
+    } else {
+        curr_pos
+    };
+    let entry = clamp_to_display_bounds(safe_prev, curr_pos);
 
-    /* notify main thread */
-    log::debug!("ENTERED @ {prev_pos:?} -> {curr_pos:?}");
-    send_blocking(CaptureEvent::Begin);
+    if dwell == 0 {
+        // 原行为：立即激活
+        ACTIVE_CLIENT.replace(pos);
+        ENTRY_POINT = entry;
+        log::debug!("ENTERED @ {prev_pos:?} -> {curr_pos:?}");
+        send_blocking(CaptureEvent::Begin);
+        return ret;
+    }
 
-    ret
+    // dwell > 0: 设置 pending + 启动 SetTimer (兜底鼠标静止场景) + 显示 indicator
+    PENDING_BARRIER = Some((pos, entry, std::time::Instant::now()));
+    let _ = SetTimer(MSG_HWND, DWELL_TIMER_ID, dwell as u32, None);
+    show_indicator(pos, curr_pos, displays);
+    log::debug!("dwell pending @ {pos:?} for {dwell}ms");
+    false
 }
 
 unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -345,15 +703,21 @@ unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
 }
 
 unsafe extern "system" fn window_proc(
-    _hwnd: HWND,
+    hwnd: HWND,
     uint: u32,
-    _wparam: WPARAM,
+    wparam: WPARAM,
     _lparam: LPARAM,
 ) -> LRESULT {
     match uint {
         x if x == WM_DISPLAYCHANGE => {
             log::debug!("display resolution changed");
             DISPLAY_RESOLUTION_CHANGED = true;
+        }
+        x if x == WM_TIMER => {
+            if wparam.0 == DWELL_TIMER_ID {
+                let _ = KillTimer(hwnd, DWELL_TIMER_ID);
+                try_activate_pending();
+            }
         }
         _ => {}
     }
@@ -526,8 +890,8 @@ fn message_thread(ready_tx: mpsc::Sender<()>) {
             }
         }
 
-        /* window is used ro receive WM_DISPLAYCHANGE messages */
-        CreateWindowExW(
+        /* window is used to receive WM_DISPLAYCHANGE / WM_TIMER messages */
+        let hwnd = CreateWindowExW(
             Default::default(),
             w!("lan-mouse-message-window-class"),
             w!("lan-mouse-msg-window"),
@@ -542,6 +906,79 @@ fn message_thread(ready_tx: mpsc::Sender<()>) {
             None,
         )
         .expect("CreateWindowExW");
+        MSG_HWND = hwnd;
+
+        /* register & create the indicator window
+         * demo 模式：纯 popup + class hbrBackground 红色，肉眼必能看到（layered window paint 有时不渲染）
+         * 正常模式：LAYERED + TRANSPARENT 半透明 + 不点击穿透 */
+        let demo = demo_mode();
+        // class 背景 brush:
+        //   - demo: 纯红（不透明，便于截图调试）
+        //   - 正常: magenta（与 LWA_COLORKEY 配合 V 外完全透明）
+        let class_brush: HBRUSH = if demo {
+            HBRUSH(CreateSolidBrush(COLORREF(0x000000FF)).0)
+        } else {
+            HBRUSH(CreateSolidBrush(COLORREF(0x00FF00FF)).0)
+        };
+        let arrow_cursor = LoadCursorW(HINSTANCE::default(), IDC_ARROW).unwrap_or_default();
+        let indicator_class: WNDCLASSW = WNDCLASSW {
+            lpfnWndProc: Some(indicator_proc),
+            hInstance: instance.into(),
+            lpszClassName: w!("lan-mouse-indicator-class"),
+            hbrBackground: class_brush,
+            hCursor: arrow_cursor,
+            ..Default::default()
+        };
+        let _ = RegisterClassW(&indicator_class);
+        let ex_style = if demo {
+            // demo 模式：保留 TRANSPARENT（鼠标点击穿透 + 避免 hCursor 未设导致的 busy 转圈）
+            WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
+        } else {
+            WS_EX_LAYERED
+                | WS_EX_TRANSPARENT
+                | WS_EX_TOPMOST
+                | WS_EX_NOACTIVATE
+                | WS_EX_TOOLWINDOW
+        };
+        let indicator_hwnd = CreateWindowExW(
+            ex_style,
+            w!("lan-mouse-indicator-class"),
+            w!("lan-mouse-indicator"),
+            WS_POPUP,
+            0,
+            0,
+            1,
+            1,
+            HWND::default(),
+            HMENU::default(),
+            instance,
+            None,
+        )
+        .expect("CreateWindowExW indicator");
+        if !demo {
+            // colorkey magenta + alpha 200: V 外像素完全透明，V 内 ~78% 不透明
+            let _ = SetLayeredWindowAttributes(
+                indicator_hwnd,
+                COLORREF(0x00FF00FF),
+                200,
+                LWA_COLORKEY | LWA_ALPHA,
+            );
+        }
+        INDICATOR_HWND = indicator_hwnd;
+
+        // demo 模式：在 virtual desktop 最左侧屏的中央显示 indicator
+        if demo_mode() {
+            let displays = get_display_regions();
+            if let Some(d) = displays.iter().min_by_key(|d| d.left) {
+                let cy = (d.top + d.bottom) / 2;
+                let cx_logical = d.left; // 鼠标进入位置取 leftmost display 的左边
+                show_indicator(Position::Left, (cx_logical, cy), displays);
+                log::info!(
+                    "indicator demo mode: leftmost display rect=({},{},{},{}) center=({},{})",
+                    d.left, d.top, d.right, d.bottom, (d.left + d.right) / 2, cy
+                );
+            }
+        }
 
         /* run message loop */
         loop {
@@ -555,6 +992,7 @@ fn message_thread(ready_tx: mpsc::Sender<()>) {
                     x if x == EventType::Exit as usize => break,
                     x if x == EventType::Release as usize => {
                         ACTIVE_CLIENT.take();
+                        restore_cursor(); // 释放回 Windows 时恢复光标
                     }
                     x if x == EventType::Request as usize => {
                         let requests = {

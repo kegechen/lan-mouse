@@ -57,6 +57,9 @@ pub enum EmulationCreationError {
     #[cfg(all(unix, feature = "x11", not(target_os = "macos")))]
     #[error("x11: `{0}`")]
     X11(#[from] X11EmulationCreationError),
+    #[cfg(all(unix, feature = "uinput", not(target_os = "macos")))]
+    #[error("uinput backend: `{0}`")]
+    Uinput(#[from] UinputEmulationCreationError),
     #[cfg(target_os = "macos")]
     #[error("macos: `{0}`")]
     MacOs(#[from] MacOSEmulationCreationError),
@@ -147,6 +150,13 @@ pub enum XdpEmulationCreationError {
 pub enum X11EmulationCreationError {
     #[error("could not open display")]
     OpenDisplay,
+}
+
+#[cfg(all(unix, feature = "uinput", not(target_os = "macos")))]
+#[derive(Debug, Error)]
+pub enum UinputEmulationCreationError {
+    #[error("uinput error: {0}")]
+    Uinput(#[from] uinput::Error),
 }
 
 #[cfg(target_os = "macos")]

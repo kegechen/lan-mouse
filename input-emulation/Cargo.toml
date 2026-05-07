@@ -42,6 +42,7 @@ ashpd = { version = "0.10", default-features = false, features = [
     "tokio",
 ], optional = true }
 reis = { version = "0.4", features = ["tokio"], optional = true }
+uinput = { version = "0.1", optional = true }
 
 [target.'cfg(target_os="macos")'.dependencies]
 bitflags = "2.6.0"
@@ -70,3 +71,4 @@ wlroots = [
 x11 = ["dep:x11"]
 remote_desktop_portal = ["dep:ashpd"]
 libei = ["dep:reis", "dep:ashpd"]
+uinput = ["dep:uinput"]
