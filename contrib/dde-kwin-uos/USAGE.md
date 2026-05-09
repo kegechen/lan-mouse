@@ -18,23 +18,58 @@ cd D:\tools\lan-mouse
 .\connect.ps1
 ```
 
+详细帮助：
+
+```powershell
+Get-Help .\connect.ps1 -Full
+Get-Help .\connect.ps1 -Examples
+```
+
 ---
 
 ## 命令行参数
 
 | 参数 | 默认 | 说明 |
 |------|------|------|
-| `-Target user@host` | `uos@192.168.137.27` | 远端 SSH 目标（需公钥免密） |
+| `-Target user@host` | `uos@192.168.137.27` | 远端 SSH 目标。**必须带 `user@`**；传裸 IP 时脚本会用 `-Hostname` 补成 `uos@host` |
 | `-Direction left/right/top/bottom` | `left` | 远端机器在 Windows 桌面的哪个方向 |
-| `-WinHostIp 192.168.x.x` | `192.168.137.1` | Windows 主机在远端能访问到的 IP |
+| `-WinHostIp 192.168.x.x` | `192.168.137.1` | Windows 主机在远端能访问到的 IP（同 WiFi 场景填 Win 的 LAN IP） |
 | `-Port 4242` | `4242` | lan-mouse UDP 端口 |
+| `-Hostname uos` | `uos` | 远端 hostname（toml 显示用 + 裸 IP 时补 `user@` 的兜底用户名） |
 | `-DwellMs N` | `0` | 鼠标到边缘必须停留 N 毫秒才越界（防误触） |
-| `-DemoIndicator` | off | 让 indicator 永久显示在屏幕左边缘（远程截图调试） |
+| `-ClipsyncPort N` | `4243` | 剪贴板同步 TCP 端口 |
+| `-NoClipsync` | off | 禁用剪贴板同步 daemon |
+| `-DemoIndicator` | off | 让 indicator 永久显示（远程截图调试） |
 | `-Setup` | — | 强制重跑配置向导 |
 | `-Force` | — | 远端强制重新拉源码 + 编译（修复损坏的安装） |
 | `-Stop` | — | 停止两端 daemon |
 
 CLI 参数会覆盖 `.connect-config.json` 的值（一次性，不写回）。
+
+### 示例
+
+```powershell
+# 最常见：无参，复用上次配置
+.\connect.ps1
+
+# Windows 移动热点（ICS）场景
+.\connect.ps1 -Target uos@192.168.137.27
+
+# Win 和 UOS 同一个 WiFi（必须带 uos@，且 -WinHostIp 填 Win 的 LAN IP）
+.\connect.ps1 -Target uos@10.81.194.113 -WinHostIp 10.81.194.50
+
+# 传裸 IP 也行，会自动补成 uos@10.81.194.113
+.\connect.ps1 -Target 10.81.194.113
+
+# UOS 在右边、防误触越界（200ms dwell）
+.\connect.ps1 -Direction right -DwellMs 200
+
+# 停掉两端 daemon
+.\connect.ps1 -Stop
+
+# 远端重拉源码重编（patch 更新后用）
+.\connect.ps1 -Force
+```
 
 ---
 
@@ -176,10 +211,30 @@ work，无需额外配置。
 
 ## 故障排查
 
-### `.\connect.ps1` 卡在 `[1/4] 测试 SSH 连通性`
+### `[1/4] 测试 SSH 连通性` 直接报 `SSH 连接失败到 <ip>`
 
-通常是远端 ssh 公钥未配置 → 远端会 prompt 密码，PS 5.1 stdin 处理 quirk
-导致 hang。修法：
+最常见三种：
+
+1. **`-Target` 没带 `user@`**：例如 `-Target 10.81.194.113`。脚本会用 `-Hostname`（默认 `uos`）补成 `uos@10.81.194.113`；如果远端用户不叫 `uos`，必须显式写 `-Target <user>@<ip>`。
+2. **公钥免密未配**：远端 prompt 密码，BatchMode 模式下直接拒绝。修法：
+   ```powershell
+   ssh-copy-id uos@<ip>
+   ```
+3. **known_hosts 冲突**：换了机器但 IP 复用，旧 host key 还在。修法：
+   ```powershell
+   ssh-keygen -R <ip>
+   ```
+
+手动验证 SSH 自己能不能登：
+```powershell
+ssh -o BatchMode=yes -o ConnectTimeout=5 uos@<ip> "echo ok"
+```
+能输出 `ok` 就说明 SSH 没问题，再回头跑 `connect.ps1`。
+
+### `.\connect.ps1` 卡在 `[1/4] 测试 SSH 连通性` 不返回
+
+通常是远端 ssh 公钥未配置 + 远端 prompt 密码导致 hang。Test-Ssh 内置 10s 硬超时，
+正常会自动 `(ssh 连通性测试 10 秒未返回，已强制中断)`。如果连这个都不出，先：
 
 ```powershell
 ssh-copy-id uos@192.168.137.27
