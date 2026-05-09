@@ -139,9 +139,16 @@ async fn handle_incoming_event(
         (ProtoEvent::Ping, addr) => {
             let _ = sender_tx.send((ProtoEvent::Pong, addr));
         }
-        (ProtoEvent::Leave(_), _) => emulate.release_keys(handle).await?,
-        (ProtoEvent::Ack(_), _) => server.set_state(State::Sending),
+        (ProtoEvent::Leave(_), _) => {
+            log::info!("got Leave from {addr} → release_keys");
+            emulate.release_keys(handle).await?
+        }
+        (ProtoEvent::Ack(_), _) => {
+            log::info!("got Ack from {addr} → state=Sending");
+            server.set_state(State::Sending)
+        }
         (ProtoEvent::Enter(_), _) => {
+            log::info!("got Enter from {addr} → state=Receiving (this releases pointer back to Windows)");
             server.set_state(State::Receiving);
             sender_tx
                 .send((ProtoEvent::Ack(0), addr))

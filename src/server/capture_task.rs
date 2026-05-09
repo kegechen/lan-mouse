@@ -100,6 +100,7 @@ async fn do_capture(
                 match e {
                     Some(e) => match e {
                         CaptureRequest::Release => {
+                            log::info!("CaptureRequest::Release → capture.release()");
                             capture.release().await?;
                             server.state.replace(State::Receiving);
                         }
@@ -138,12 +139,14 @@ async fn handle_capture_event(
 
     // release capture if emulation set state to Receiveing
     if server.get_state() == State::Receiving {
+        log::info!("state==Receiving on capture event {event:?} → capture.release() (someone flipped state)");
         capture.release().await?;
         return Ok(());
     }
 
     // check release bind
     if capture.keys_pressed(&server.release_bind) {
+        log::info!("release_bind pressed → capture.release()");
         capture.release().await?;
         server.set_state(State::Receiving);
     }

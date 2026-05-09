@@ -234,6 +234,20 @@ fn demo_mode() -> bool {
     parsed
 }
 
+fn debug_motion() -> bool {
+    use std::sync::atomic::{AtomicI8, Ordering};
+    static CACHED: AtomicI8 = AtomicI8::new(-1);
+    let v = CACHED.load(Ordering::Relaxed);
+    if v != -1 {
+        return v == 1;
+    }
+    let parsed = std::env::var("LAN_MOUSE_DEBUG_MOTION")
+        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    CACHED.store(if parsed { 1 } else { 0 }, Ordering::Relaxed);
+    parsed
+}
+
 unsafe fn hide_indicator() {
     if INDICATOR_HWND.0.is_null() {
         return;
@@ -414,7 +428,7 @@ unsafe fn try_activate_pending() {
     ACTIVE_CLIENT.replace(pos);
     ENTRY_POINT = entry;
     hide_indicator();
-    log::debug!("dwell satisfied (timer path) -> activate @ {pos:?}");
+    log::info!("BEGIN (dwell timer): pos={pos:?} entry=({},{})", entry.0, entry.1);
     send_blocking(CaptureEvent::Begin);
 }
 
@@ -455,6 +469,24 @@ fn to_mouse_event(wparam: WPARAM, lparam: LPARAM) -> Option<PointerEvent> {
             let (x, y) = (mouse_low_level.pt.x, mouse_low_level.pt.y);
             let (ex, ey) = ENTRY_POINT;
             let (dx, dy) = (x - ex, y - ey);
+
+            // === 漫游失败诊断 ===
+            // 现象：漫游后 Windows 出现弹窗/通知 → UOS 鼠标瞬间跳飞或贴边卡死。
+            // 假设：弹窗触发 SetCursorPos（"Snap To" 或 app 自己调用），把
+            // 系统光标移离 ENTRY_POINT。lan-mouse 的 dx = pt - ENTRY_POINT
+            // 算法依赖光标固定在 ENTRY_POINT 不动；一旦被强制移动，dx/dy 就
+            // 会爆掉成几百几千，UOS 端鼠标按累计偏移瞬移。
+            // 启用：LAN_MOUSE_DEBUG_MOTION=1（每个 motion 一行 debug）。
+            if debug_motion() {
+                let mut sys = POINT { x: 0, y: 0 };
+                let _ = GetCursorPos(&mut sys);
+                log::debug!(
+                    "motion pt=({x},{y}) entry=({ex},{ey}) delta=({dx},{dy}) sys_cursor=({},{})",
+                    sys.x,
+                    sys.y
+                );
+            }
+
             let (dx, dy) = (dx as f64, dy as f64);
             Some(PointerEvent::Motion { time: 0, dx, dy })
         },
@@ -599,7 +631,11 @@ unsafe fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
                     ACTIVE_CLIENT.replace(pending_pos);
                     ENTRY_POINT = entry;
                     hide_indicator();
-                    log::debug!("dwell satisfied (motion path) -> activate @ {pending_pos:?}");
+                    log::info!(
+                        "BEGIN (dwell motion): pos={pending_pos:?} entry=({},{})",
+                        entry.0,
+                        entry.1
+                    );
                     send_blocking(CaptureEvent::Begin);
                 }
                 return ACTIVE_CLIENT.is_some();
@@ -641,7 +677,11 @@ unsafe fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
         // 原行为：立即激活
         ACTIVE_CLIENT.replace(pos);
         ENTRY_POINT = entry;
-        log::debug!("ENTERED @ {prev_pos:?} -> {curr_pos:?}");
+        log::info!(
+            "BEGIN (immediate): pos={pos:?} prev={prev_pos:?} curr={curr_pos:?} entry=({},{})",
+            entry.0,
+            entry.1
+        );
         send_blocking(CaptureEvent::Begin);
         return ret;
     }
@@ -675,7 +715,7 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
 
     /* notify mainthread (drop events if sending too fast) */
     if let Err(e) = EVENT_TX.as_ref().unwrap().try_send(event) {
-        log::warn!("e: {e}");
+        log::warn!("dropped capture event (channel full / closed): {e}");
     }
 
     /* don't pass event to applications */
@@ -695,7 +735,7 @@ unsafe extern "system" fn kybrd_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
     let event = (client, CaptureEvent::Input(Event::Keyboard(key_event)));
 
     if let Err(e) = EVENT_TX.as_ref().unwrap().try_send(event) {
-        log::warn!("e: {e}");
+        log::warn!("dropped key event (channel full / closed): {e}");
     }
 
     /* don't pass event to applications */
@@ -991,7 +1031,8 @@ fn message_thread(ready_tx: mpsc::Sender<()>) {
                 match msg.wParam.0 {
                     x if x == EventType::Exit as usize => break,
                     x if x == EventType::Release as usize => {
-                        ACTIVE_CLIENT.take();
+                        let was = ACTIVE_CLIENT.take();
+                        log::info!("RELEASE: was_active={was:?}");
                         restore_cursor(); // 释放回 Windows 时恢复光标
                     }
                     x if x == EventType::Request as usize => {
