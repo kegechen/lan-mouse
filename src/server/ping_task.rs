@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, time::Duration};
 
 use lan_mouse_proto::ProtoEvent;
 use local_channel::mpsc::Sender;
@@ -8,7 +8,13 @@ use lan_mouse_ipc::ClientHandle;
 
 use super::{capture_task::CaptureRequest, emulation_task::EmulationRequest, Server, State};
 
-const MAX_RESPONSE_TIME: Duration = Duration::from_millis(500);
+// 单次 ping round 等多久 client 回 alive。Mobile Hotspot / WiFi Direct
+// 在系统弹窗、power state 变化时会有短暂转发停顿（Connected Standby +
+// WLAN AutoConfig），原 500ms 太苛刻。
+const MAX_RESPONSE_TIME: Duration = Duration::from_millis(2000);
+// 连续多少次 ping miss 才判失联。单次抖动不立即 release pointer，避免漫游过程中
+// 一个弹窗就把光标拽回 Windows。
+const MAX_PING_MISSES: u32 = 3;
 
 pub(crate) fn new(
     server: Server,
@@ -31,6 +37,8 @@ async fn ping_task(
     emulate_notify: Sender<EmulationRequest>,
     capture_notify: Sender<CaptureRequest>,
 ) {
+    // 跨 ping round 累积每个 client 连续 miss 次数；本轮响应到了即清零。
+    let mut miss_counts: HashMap<ClientHandle, u32> = HashMap::new();
     loop {
         // wait for wake up signal
         server.ping_timer_notified().await;
@@ -118,19 +126,40 @@ async fn ping_task(
                     .collect()
             };
 
+            // 更新连续 miss 计数：本轮响应过的 client 清 0，未响应的 +1。
+            for &h in &ping_clients {
+                if unresponsive_clients.contains(&h) {
+                    *miss_counts.entry(h).or_insert(0) += 1;
+                } else {
+                    miss_counts.remove(&h);
+                }
+            }
+
+            // 只有连续 miss >= MAX_PING_MISSES 才真正判失联。
+            let release_clients: Vec<ClientHandle> = unresponsive_clients
+                .iter()
+                .copied()
+                .filter(|h| miss_counts.get(h).copied().unwrap_or(0) >= MAX_PING_MISSES)
+                .collect();
+
             // we may not be receiving anymore but we should respond
             // to the original state and not the "new" one
             if receiving {
-                for h in unresponsive_clients {
-                    log::warn!("device not responding, releasing keys!");
-                    let _ = emulate_notify.send(EmulationRequest::ReleaseKeys(h));
+                for h in &release_clients {
+                    log::warn!(
+                        "device not responding ({MAX_PING_MISSES} consecutive misses), releasing keys!"
+                    );
+                    let _ = emulate_notify.send(EmulationRequest::ReleaseKeys(*h));
+                    miss_counts.remove(h);
                 }
-            } else {
-                // release pointer if the active client has not responded
-                if !unresponsive_clients.is_empty() {
-                    log::warn!("client not responding, releasing pointer!");
-                    server.state.replace(State::Receiving);
-                    let _ = capture_notify.send(CaptureRequest::Release);
+            } else if !release_clients.is_empty() {
+                log::warn!(
+                    "client not responding ({MAX_PING_MISSES} consecutive misses), releasing pointer!"
+                );
+                server.state.replace(State::Receiving);
+                let _ = capture_notify.send(CaptureRequest::Release);
+                for h in &release_clients {
+                    miss_counts.remove(h);
                 }
             }
         }
