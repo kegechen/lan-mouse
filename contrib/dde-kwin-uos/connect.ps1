@@ -417,8 +417,15 @@ ACTIVE_CONN=$(nmcli -t -f NAME c show --active 2>/dev/null | head -1)
 if [ -n "$ACTIVE_CONN" ]; then
     nmcli connection modify "$ACTIVE_CONN" 802-11-wireless.powersave 2 2>/dev/null || true
     nmcli connection modify "$ACTIVE_CONN" 802-11-wireless.wake-on-wlan ignore 2>/dev/null || true
-    nmcli connection modify "$ACTIVE_CONN" ipv4.dns "119.29.29.29 223.5.5.5 8.8.8.8" 2>/dev/null || true
-    nmcli connection modify "$ACTIVE_CONN" ipv4.ignore-auto-dns yes 2>/dev/null || true
+    # 仅在当前 DNS 解析不了下载源时才覆盖——企业内网常配私有 DNS 解内部域名，
+    # 直接强写公网 DNS 会破坏 OA/Wiki/内部 Git 解析
+    if ! getent hosts rsproxy.cn >/dev/null 2>&1 && ! getent hosts github.com >/dev/null 2>&1; then
+        echo "  (当前 DNS 解析不了 rsproxy.cn/github.com，临时改公网 DNS)"
+        nmcli connection modify "$ACTIVE_CONN" ipv4.dns "119.29.29.29 223.5.5.5 8.8.8.8" 2>/dev/null || true
+        nmcli connection modify "$ACTIVE_CONN" ipv4.ignore-auto-dns yes 2>/dev/null || true
+    else
+        echo "  (DNS 解析正常，不动用户 DNS 配置)"
+    fi
     [ -n "$ACTIVE_DEV" ] && nmcli device reapply "$ACTIVE_DEV" 2>/dev/null || true
 fi
 mkdir -p /etc/NetworkManager/conf.d
