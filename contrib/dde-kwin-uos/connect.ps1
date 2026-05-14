@@ -95,7 +95,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ScriptDir   = Split-Path -Parent $MyInvocation.MyCommand.Path
-$PatchDir    = Join-Path $ScriptDir 'patches'
+# 本仓库根 = 这个 patched lan-mouse fork 的源码树根，远端编译用的就是这棵树（git archive HEAD 打包）
+$RepoRoot    = (Resolve-Path (Join-Path $ScriptDir '..\..')).Path
 $WinBinDir   = Join-Path $ScriptDir 'bin'
 $WinExe      = Join-Path $WinBinDir 'lan-mouse.exe'
 $WinCfg      = Join-Path $ScriptDir 'config.toml'
@@ -386,17 +387,20 @@ function Install-Remote {
 
     $opp = @{ left='right'; right='left'; top='bottom'; bottom='top' }[$script:ResolvedDirection]
 
-    Write-Sub "上传 5 个 patch 文件..."
-    foreach ($pair in @(
-        @('uinput.rs',                  '/tmp/lan-mouse-patches-uinput.rs'),
-        @('lib.rs',                     '/tmp/lan-mouse-patches-lib.rs'),
-        @('error.rs',                   '/tmp/lan-mouse-patches-error.rs'),
-        @('input-emulation-Cargo.toml', '/tmp/lan-mouse-patches-ie-Cargo.toml'),
-        @('root-Cargo.toml',            '/tmp/lan-mouse-patches-root-Cargo.toml'))) {
-        $local  = Join-Path $PatchDir $pair[0]
-        $remote = $pair[1]
-        Copy-ToRemote -Local $local -Remote $remote
+    # 把整棵 patched 源码树打包丢过去，远端解压即编译——比早期 "git clone v0.10.0 + cp 5 个 patch"
+    # 健壮得多：不会因为 patch 列表漂移漏文件（v0.10.0..HEAD 实际改了 9 个源码文件），
+    # 远端也不再依赖 git/clone 网络可达
+    Write-Sub "打包源码树 (git archive HEAD)..."
+    $tarball = Join-Path $env:TEMP 'lan-mouse-src.tar.gz'
+    Remove-Item -LiteralPath $tarball -ErrorAction SilentlyContinue
+    & git -C $RepoRoot archive --format=tar.gz -o $tarball HEAD 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $tarball)) {
+        Write-Err2 "git archive 失败（exit $LASTEXITCODE）"
+        exit 1
     }
+    $sizeKb = [math]::Round((Get-Item $tarball).Length / 1KB, 1)
+    Write-Sub "上传源码包 ($sizeKb KB)..."
+    Copy-ToRemote -Local $tarball -Remote '/tmp/lan-mouse-src.tar.gz'
 
     Write-Sub "上传 UOS config.toml..."
     $uosCfg = @"
@@ -450,7 +454,16 @@ chgrp input /dev/uinput 2>/dev/null || true
 chmod 660 /dev/uinput 2>/dev/null || true
 id -nG "$TARGET_USER" | tr ' ' '\n' | grep -qx input || usermod -aG input "$TARGET_USER"
 
-echo "[3/8] apt deps (libx11-dev libxtst-dev — may fail on UOS due to system pkg conflicts, ignore)"
+echo "[3/8] apt deps"
+# build-essential: 提供 gcc/make/libc6-dev，cargo 编含 C 绑定的 crate (ring/openssl-sys/cc) 时必需，
+#   Kylin/UOS server 最小化镜像或精简容器里默认没有，桌面版一般有，无脑装更稳。
+# libudev-dev/libxkbcommon-dev: 通过 pkg-config 被 libudev-sys/xkbcommon 找；Kylin/UOS 默认只装
+#   runtime libudev1/libxkbcommon0，开发头不会自动来。
+# pkg-config: 上面两个 -dev 包都靠它定位 .pc 文件。
+# 全部必须成功，失败就 set -e abort（源码 tarball 来自 Win 端 [6/8]，不再依赖远端 git）
+DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    build-essential libudev-dev libxkbcommon-dev pkg-config
+# libx11-dev/libxtst-dev 在某些 UOS 镜像上与系统包冲突，失败可忽略（uinput 后端不强制依赖）
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libx11-dev libxtst-dev 2>&1 | tail -3 || true
 
 echo "[4-8/8] handing off to user-side install"
@@ -503,18 +516,15 @@ registry = "sparse+https://rsproxy.cn/index/"
 EOF
 } > "$HOME/.cargo/config.toml"
 
-echo "[6/8] clone lan-mouse v0.10.0 + apply patches"
-mkdir -p "$HOME/src"
-cd "$HOME/src"
-[ -d lan-mouse ] || git clone --depth 1 --branch v0.10.0 https://github.com/feschber/lan-mouse.git
-cp /tmp/lan-mouse-patches-uinput.rs        lan-mouse/input-emulation/src/uinput.rs
-cp /tmp/lan-mouse-patches-lib.rs           lan-mouse/input-emulation/src/lib.rs
-cp /tmp/lan-mouse-patches-error.rs         lan-mouse/input-emulation/src/error.rs
-cp /tmp/lan-mouse-patches-ie-Cargo.toml    lan-mouse/input-emulation/Cargo.toml
-cp /tmp/lan-mouse-patches-root-Cargo.toml  lan-mouse/Cargo.toml
+echo "[6/8] deploy lan-mouse source tree"
+# 直接解压 Win 端推过来的 git archive HEAD 源码包；之前是 "git clone v0.10.0 + cp 几个 patch 文件覆盖"，
+# patch 列表与本仓 v0.10.0..HEAD 漂移导致 src/server/* 的近期 ping 修复永远漏掉。
+rm -rf "$HOME/src/lan-mouse"
+mkdir -p "$HOME/src/lan-mouse"
+tar xzf /tmp/lan-mouse-src.tar.gz -C "$HOME/src/lan-mouse"
 
 echo "[7/8] cargo install (1-3 minutes on first build)"
-cd lan-mouse
+cd "$HOME/src/lan-mouse"
 cargo install --locked --path . --no-default-features --features uinput_emulation --force
 
 echo "[8/8] deploy uos config"
