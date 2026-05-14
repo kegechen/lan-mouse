@@ -332,7 +332,17 @@ function Enable-KeyAuth {
 }
 function Copy-ToRemote {
     param([string]$Local, [string]$Remote)
+    # 源文件不存在 / scp 非零退出 都要立刻 fail —— 之前静默 Out-Null 把 exit 255 吞掉，
+    # 让远端 install-user.sh 用一个不存在的 /tmp/xxx 文件，set -eu 才在那里 abort，根因被掩盖
+    if (-not (Test-Path -LiteralPath $Local)) {
+        Write-Err2 "上传源文件不存在: $Local"
+        exit 1
+    }
     & scp.exe -q $Local "$($script:ResolvedTarget):$Remote" 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Err2 "scp 上传失败（exit $LASTEXITCODE）: $Local -> $Remote"
+        exit 1
+    }
 }
 
 # ---------- probe remote state ----------
