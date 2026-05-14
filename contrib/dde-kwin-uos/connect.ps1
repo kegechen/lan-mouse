@@ -6,7 +6,8 @@
     通过 SSH 探测远端环境，按需安装/启动 lan-mouse，并启动 Windows 端 daemon
     完成对接。第一次运行会进入交互配置向导（询问 SSH 目标 + UOS 方向 + 主机 IP）
     并保存到 .connect-config.json，后续运行无需再问。
-    SSH 公钥认证（请先 ssh-copy-id 配置好密钥）；安装时一次性 prompt sudo 密码。
+    SSH 优先公钥免密；首次跑若未配免密会引导用密码登录一次、自动把本机公钥
+    推到远端 authorized_keys，之后免密。安装时一次性 prompt sudo 密码。
 
 .PARAMETER Target
     SSH 目标，格式 user@host（**必须带 user@**，否则会拿 Windows 用户名去登远端、SSH 直接失败）。
@@ -218,7 +219,8 @@ function Invoke-Ssh {
     return (& ssh.exe @script:SshOpts $script:ResolvedTarget $Cmd 2>&1)
 }
 function Test-Ssh {
-    # 用 Start-Job 包硬超时，避免 ssh.exe hang 时整个脚本卡住
+    # 返回 hashtable：ok=$bool，reason='auth|network|timeout'，output=ssh 原始输出。
+    # 用 Start-Job 包硬超时，避免 ssh.exe hang 时整个脚本卡住。
     $job = Start-Job -ScriptBlock {
         param($t)
         & ssh.exe -o ConnectTimeout=5 `
@@ -233,11 +235,100 @@ function Test-Ssh {
         try { Stop-Job $job -ErrorAction SilentlyContinue } catch {}
         try { Remove-Job $job -Force -ErrorAction SilentlyContinue } catch {}
         Write-Sub "(ssh 连通性测试 10 秒未返回，已强制中断)"
-        return $false
+        return @{ ok=$false; reason='timeout'; output='' }
     }
     $r = Receive-Job $job 2>&1
     Remove-Job $job -Force -ErrorAction SilentlyContinue
-    return ((($r | Out-String) -match 'ok'))
+    $text = ($r | Out-String)
+    # 必须是独占一行的 "ok"，否则远端 MOTD/banner 含 "ok" 字样会误判通过。
+    if ($text -match '(?m)^ok\s*$') { return @{ ok=$true; reason=''; output=$text } }
+    # 公钥被拒（或 BatchMode 拒绝交互认证）=> auth 问题，可用密码补救。
+    # Connection refused / timeout / Host unreachable 是网络层问题、密码救不了。
+    if ($text -match 'Permission denied|publickey|keyboard-interactive|password') {
+        return @{ ok=$false; reason='auth'; output=$text }
+    }
+    return @{ ok=$false; reason='network'; output=$text }
+}
+
+function Enable-KeyAuth {
+    # 用户没配公钥免密时，提示用密码登录一次、把本机公钥追加到远端 authorized_keys。
+    # 成功返回 $true（之后所有 ssh/scp 调用自动走免密），失败返回 $false。
+    Write-Warn2 "远端未配置公钥免密登录"
+    $choice = Read-Host "    现在用密码登录一次、把本机 SSH 公钥拷到远端？(Y/n)"
+    if ($choice -match '^[nN]') {
+        Write-Sub ("已取消。手动配置：ssh-copy-id " + $script:ResolvedTarget)
+        return $false
+    }
+
+    # 1. 本机准备公钥（优先 ed25519，无则 RSA，都没有就生成 ed25519）
+    $sshDir = Join-Path $env:USERPROFILE '.ssh'
+    if (-not (Test-Path $sshDir)) {
+        New-Item -ItemType Directory -Path $sshDir -Force | Out-Null
+    }
+    $edPub  = Join-Path $sshDir 'id_ed25519.pub'
+    $rsaPub = Join-Path $sshDir 'id_rsa.pub'
+    $pubFile = $null
+    if     (Test-Path $edPub)  { $pubFile = $edPub  }
+    elseif (Test-Path $rsaPub) { $pubFile = $rsaPub }
+    else {
+        Write-Sub "本机无 SSH 密钥，生成 ed25519 (无 passphrase)..."
+        $edKey = Join-Path $sshDir 'id_ed25519'
+        # PS 5.1 native-call 对 `-N ""` 传参不稳；用 ProcessStartInfo 显式控制 args+stdin。
+        # ssh-keygen 在 -f 已指定但缺 -N 时会从 stdin 读两次 passphrase（输入+确认），喂两个空行。
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = 'ssh-keygen.exe'
+        $psi.Arguments = "-t ed25519 -q -f `"$edKey`""
+        $psi.UseShellExecute        = $false
+        $psi.RedirectStandardInput  = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError  = $true
+        $psi.CreateNoWindow         = $true
+        $kp = [System.Diagnostics.Process]::Start($psi)
+        $kp.StandardInput.WriteLine('')
+        $kp.StandardInput.WriteLine('')
+        $kp.StandardInput.Close()
+        if (-not $kp.WaitForExit(10000)) { try { $kp.Kill() } catch {} }
+        if ($kp.ExitCode -ne 0 -or -not (Test-Path $edPub)) {
+            Write-Err2 "ssh-keygen 失败，无法生成密钥"
+            return $false
+        }
+        $pubFile = $edPub
+    }
+    Write-Sub ("使用公钥: " + $pubFile)
+
+    # 2. 用密码登录、把 pubkey 追加进 authorized_keys。
+    #    BatchMode=no + PreferredAuthentications=password,keyboard-interactive 让 ssh 直接 prompt
+    #    密码到当前终端（Invoke-Ssh 不能用 —— 它 BatchMode 写死、且会重定向 stdin/stderr）。
+    #    PubkeyAuthentication=no 跳过失败的 pubkey 尝试，直接进密码流程。
+    $pubContent = (Get-Content $pubFile -Raw).Trim()
+    if ([string]::IsNullOrWhiteSpace($pubContent)) {
+        Write-Err2 ("公钥文件为空: " + $pubFile)
+        return $false
+    }
+    # 单引号包 pubkey 防 bash 二次展开（ssh 公钥本身不含单引号，安全）
+    $remoteCmd = "umask 077; mkdir -p ~/.ssh; touch ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys; grep -qxF '$pubContent' ~/.ssh/authorized_keys || echo '$pubContent' >> ~/.ssh/authorized_keys"
+    Write-Sub "下面会提示远端密码（只需输入一次）"
+    & ssh.exe -o BatchMode=no `
+              -o StrictHostKeyChecking=accept-new `
+              -o PreferredAuthentications=password,keyboard-interactive `
+              -o PubkeyAuthentication=no `
+              $script:ResolvedTarget $remoteCmd
+    if ($LASTEXITCODE -ne 0) {
+        Write-Err2 "密码登录或公钥写入失败"
+        Write-Sub "（远端 sshd 可能也禁用了密码登录 PasswordAuthentication=no，需管理员手动添加公钥）"
+        return $false
+    }
+    Write-OK "公钥已写入远端 ~/.ssh/authorized_keys"
+
+    # 3. 复测免密
+    $retest = Test-Ssh
+    if (-not $retest.ok) {
+        Write-Err2 "公钥已传，但免密复测仍失败:"
+        Write-Sub $retest.output
+        Write-Sub "（如果本机私钥需 passphrase，先运行 ssh-add 把私钥加进 ssh-agent）"
+        return $false
+    }
+    return $true
 }
 function Copy-ToRemote {
     param([string]$Local, [string]$Remote)
@@ -699,12 +790,22 @@ Write-Host ""
 if ($Stop) { Stop-AllDaemons; return }
 
 Write-Step "[1/4] 测试 SSH 连通性"
-if (-not (Test-Ssh)) {
-    Write-Err2 "SSH 连接失败到 $($script:ResolvedTarget)"
-    Write-Sub "确认对方在线、网络通"
-    Write-Sub ("确认已设公钥免密: ssh-copy-id " + $script:ResolvedTarget)
-    Write-Sub ("（需要重新配置可加 -Setup 或删除 $ConfigPath）")
-    exit 1
+$sshTest = Test-Ssh
+if (-not $sshTest.ok) {
+    if ($sshTest.reason -eq 'auth') {
+        # 公钥被拒：引导用密码登录一次、自动写公钥到远端
+        if (-not (Enable-KeyAuth)) {
+            Write-Err2 "SSH 公钥免密未能自动配置"
+            Write-Sub ("（需要重新配置可加 -Setup 或删除 $ConfigPath）")
+            exit 1
+        }
+    } else {
+        Write-Err2 "SSH 连接失败到 $($script:ResolvedTarget)（$($sshTest.reason)）"
+        Write-Sub "确认对方在线、网络通"
+        if ($sshTest.output) { Write-Sub $sshTest.output.TrimEnd() }
+        Write-Sub ("（需要重新配置可加 -Setup 或删除 $ConfigPath）")
+        exit 1
+    }
 }
 Write-OK "SSH 通"
 

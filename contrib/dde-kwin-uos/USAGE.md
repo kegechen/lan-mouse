@@ -211,25 +211,32 @@ work，无需额外配置。
 
 ## 故障排查
 
-### `[1/4] 测试 SSH 连通性` 直接报 `SSH 连接失败到 <ip>`
+### `[1/4] 测试 SSH 连通性` 失败
 
-最常见三种：
+脚本会区分**网络层**和**认证层**两类问题：
 
-1. **`-Target` 没带 `user@`**：例如 `-Target 10.81.194.113`。脚本会用 `-Hostname`（默认 `uos`）补成 `uos@10.81.194.113`；如果远端用户不叫 `uos`，必须显式写 `-Target <user>@<ip>`。
-2. **公钥免密未配**：远端 prompt 密码，BatchMode 模式下直接拒绝。修法：
-   ```powershell
-   ssh-copy-id uos@<ip>
-   ```
-3. **known_hosts 冲突**：换了机器但 IP 复用，旧 host key 还在。修法：
-   ```powershell
-   ssh-keygen -R <ip>
-   ```
+- **认证层（公钥免密没配）**：检测到 `Permission denied` 后会引导你**用密码登录一次**，
+  自动把本机 `~/.ssh/id_ed25519.pub`（没有则现场生成）追加到远端 `~/.ssh/authorized_keys`，
+  之后所有调用走免密。提示符如下：
+  ```
+  [!!] 远端未配置公钥免密登录
+       现在用密码登录一次、把本机 SSH 公钥拷到远端？(Y/n):
+  ```
+  输 `Y` 回车 → 提示远端密码 → 输入 → 完成。下次跑就免密了。
+- **网络层（连不上）**：Connection refused / timeout / Host unreachable 这类密码救不了，
+  脚本直接报错退出。常见原因：
+  1. **`-Target` 没带 `user@`**：例如 `-Target 10.81.194.113`。脚本会用 `-Hostname`（默认 `uos`）补成 `uos@10.81.194.113`；如果远端用户不叫 `uos`，必须显式写 `-Target <user>@<ip>`。
+  2. **对方不在线 / IP 错 / 防火墙挡 22**：先 `ping <ip>` 确认主机活、`Test-NetConnection <ip> -Port 22` 确认 SSH 端口通。
+  3. **known_hosts 冲突**：换了机器但 IP 复用，旧 host key 还在。修法：
+     ```powershell
+     ssh-keygen -R <ip>
+     ```
 
 手动验证 SSH 自己能不能登：
 ```powershell
 ssh -o BatchMode=yes -o ConnectTimeout=5 uos@<ip> "echo ok"
 ```
-能输出 `ok` 就说明 SSH 没问题，再回头跑 `connect.ps1`。
+能输出 `ok` 就说明免密通了，再回头跑 `connect.ps1`。
 
 ### `.\connect.ps1` 卡在 `[1/4] 测试 SSH 连通性` 不返回
 
