@@ -407,7 +407,6 @@ port = $($script:ResolvedPort)
     $rootSh = @'
 #!/bin/bash
 set -eu
-PROXY="http://192.168.137.1:10808"
 TARGET_USER="${SUDO_USER:-$(logname 2>/dev/null || echo unknown)}"
 USER_HOME=$(getent passwd "$TARGET_USER" | cut -d: -f6)
 [ -n "$USER_HOME" ] || { echo "cannot resolve home dir for $TARGET_USER"; exit 1; }
@@ -445,8 +444,19 @@ sudo -u "$TARGET_USER" -H bash /tmp/install-user.sh
     $userSh = @'
 #!/bin/bash
 set -eu
-PROXY="http://192.168.137.1:10808"
-export HTTP_PROXY="$PROXY" HTTPS_PROXY="$PROXY" http_proxy="$PROXY" https_proxy="$PROXY"
+# WIN_IP 由 connect.ps1 在生成本脚本时填入（来自配置或 UOS 自动探测到的 SSH 源 IP）
+WIN_IP="__WIN_IP__"
+PROXY_CANDIDATE="http://${WIN_IP}:10808"
+
+# 优先走 Win 端代理（ICS/GFW 场景常见），探测不通则走直连——UOS 在普通 LAN 下自己能上网
+if curl -fsS --connect-timeout 3 --proxy "$PROXY_CANDIDATE" -o /dev/null https://sh.rustup.rs 2>/dev/null; then
+    PROXY="$PROXY_CANDIDATE"
+    export HTTP_PROXY="$PROXY" HTTPS_PROXY="$PROXY" http_proxy="$PROXY" https_proxy="$PROXY"
+    echo "(走代理 $PROXY)"
+else
+    PROXY=""
+    echo "(Win 代理 $PROXY_CANDIDATE 不可达，走直连)"
+fi
 
 echo "[4/8] Rust toolchain"
 if [ ! -x "$HOME/.cargo/bin/cargo" ]; then
@@ -459,11 +469,14 @@ fi
 
 echo "[5/8] cargo proxy + crates.io mirror"
 mkdir -p "$HOME/.cargo"
-cat > "$HOME/.cargo/config.toml" <<EOF
-[http]
-proxy = "$PROXY"
-[https]
-proxy = "$PROXY"
+{
+    if [ -n "$PROXY" ]; then
+        echo "[http]"
+        echo "proxy = \"$PROXY\""
+        echo "[https]"
+        echo "proxy = \"$PROXY\""
+    fi
+    cat <<EOF
 [net]
 git-fetch-with-cli = true
 [source.crates-io]
@@ -471,6 +484,7 @@ replace-with = "rsproxy-sparse"
 [source.rsproxy-sparse]
 registry = "sparse+https://rsproxy.cn/index/"
 EOF
+} > "$HOME/.cargo/config.toml"
 
 echo "[6/8] clone lan-mouse v0.10.0 + apply patches"
 mkdir -p "$HOME/src"
@@ -493,6 +507,9 @@ cp /tmp/lan-mouse-config.toml "$HOME/.config/lan-mouse/config.toml"
 echo "BUILD_DONE"
 ls -la "$HOME/.cargo/bin/lan-mouse"
 '@
+    # 把当前 Win 主机 IP 注入 install-user.sh 的代理探测逻辑（用 ResolvedWinHostIp，
+    # 它在 Probe-Remote 后已经被 SSH 源 IP 自动校正）
+    $userSh = $userSh.Replace('__WIN_IP__', $script:ResolvedWinHostIp)
     $tmpRoot = Join-Path $env:TEMP 'lan-mouse-install.sh'
     $tmpUser = Join-Path $env:TEMP 'lan-mouse-install-user.sh'
     [System.IO.File]::WriteAllText($tmpRoot, $rootSh, [System.Text.UTF8Encoding]::new($false))
