@@ -28,7 +28,7 @@ use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect,
     GetCursorPos, GetMessageW, KillTimer, LoadCursorW, PostThreadMessageW, RegisterClassW,
-    SetLayeredWindowAttributes, SetTimer, SetWindowPos, SetWindowsHookExW, ShowCursor,
+    SetCursorPos, SetLayeredWindowAttributes, SetTimer, SetWindowPos, SetWindowsHookExW, ShowCursor,
     ShowWindow, TranslateMessage, EDD_GET_DEVICE_INTERFACE_NAME, HHOOK, HMENU, HOOKPROC,
     HWND_TOPMOST, IDC_ARROW, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LWA_ALPHA, LWA_COLORKEY, MSG,
     MSLLHOOKSTRUCT, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, WH_KEYBOARD_LL, WH_MOUSE_LL,
@@ -120,6 +120,27 @@ unsafe fn get_event_tid() -> Option<u32> {
 }
 
 static mut ENTRY_POINT: (i32, i32) = (0, 0);
+// 系统光标每帧 motion 后会被 SetCursorPos 推回这个锚点（激活时 = 入口屏幕中心），
+// 所以 to_mouse_event 看到的 pt - MOTION_ANCHOR 就是本帧 raw delta，不会因为
+// Windows 把系统光标 clamp 在屏幕边界而卡住 — 这正是入口贴近主屏边缘时
+// "远端某方向无法移动 / 自动反向跳" 的根因。
+static mut MOTION_ANCHOR: (i32, i32) = (0, 0);
+// 自注入 SetCursorPos 触发的 mouse hook fire 计数：mouse_proc 看到 >0 就 decrement 并 swallow,
+// 不让 reset 自身的 hook fire 被当成用户输入而产生反向 motion。
+static INJECTED_MOTION: AtomicU32 = AtomicU32::new(0);
+
+unsafe fn warp_cursor_to(point: (i32, i32)) {
+    INJECTED_MOTION.fetch_add(1, Ordering::SeqCst);
+    let _ = SetCursorPos(point.0, point.1);
+}
+
+unsafe fn anchor_for_entry(entry: (i32, i32), displays: &[RECT]) -> (i32, i32) {
+    if let Some(d) = displays.iter().find(|d| is_within_dp_region(entry, d)) {
+        ((d.left + d.right) / 2, (d.top + d.bottom) / 2)
+    } else {
+        entry
+    }
+}
 
 // === lan-mouse dwell-time patch (sticky corners) ===
 // 鼠标必须在屏幕边界停留 N 毫秒才会越界，避免误触。
@@ -427,9 +448,14 @@ unsafe fn try_activate_pending() {
     }
     ACTIVE_CLIENT.replace(pos);
     ENTRY_POINT = entry;
+    MOTION_ANCHOR = anchor_for_entry(entry, get_display_regions());
     hide_indicator();
-    log::info!("BEGIN (dwell timer): pos={pos:?} entry=({},{})", entry.0, entry.1);
+    log::info!(
+        "BEGIN (dwell timer): pos={pos:?} entry=({},{}) anchor=({},{})",
+        entry.0, entry.1, MOTION_ANCHOR.0, MOTION_ANCHOR.1
+    );
     send_blocking(CaptureEvent::Begin);
+    warp_cursor_to(MOTION_ANCHOR);
 }
 
 fn to_mouse_event(wparam: WPARAM, lparam: LPARAM) -> Option<PointerEvent> {
@@ -467,21 +493,18 @@ fn to_mouse_event(wparam: WPARAM, lparam: LPARAM) -> Option<PointerEvent> {
         }),
         WPARAM(p) if p == WM_MOUSEMOVE as usize => unsafe {
             let (x, y) = (mouse_low_level.pt.x, mouse_low_level.pt.y);
-            let (ex, ey) = ENTRY_POINT;
+            // dx/dy 是"本帧 raw delta"：MOTION_ANCHOR 由 mouse_proc 末尾每帧 SetCursorPos
+            // 强行维护，所以 pt - MOTION_ANCHOR 就是本帧用户实际移动量，不受系统光标
+            // 屏幕边界 clamp 影响。
+            let (ex, ey) = MOTION_ANCHOR;
             let (dx, dy) = (x - ex, y - ey);
 
-            // === 漫游失败诊断 ===
-            // 现象：漫游后 Windows 出现弹窗/通知 → UOS 鼠标瞬间跳飞或贴边卡死。
-            // 假设：弹窗触发 SetCursorPos（"Snap To" 或 app 自己调用），把
-            // 系统光标移离 ENTRY_POINT。lan-mouse 的 dx = pt - ENTRY_POINT
-            // 算法依赖光标固定在 ENTRY_POINT 不动；一旦被强制移动，dx/dy 就
-            // 会爆掉成几百几千，UOS 端鼠标按累计偏移瞬移。
-            // 启用：LAN_MOUSE_DEBUG_MOTION=1（每个 motion 一行 debug）。
+            // LAN_MOUSE_DEBUG_MOTION=1 时每个 motion 一行 debug，用于排查"远端瞬移 / 卡死"。
             if debug_motion() {
                 let mut sys = POINT { x: 0, y: 0 };
                 let _ = GetCursorPos(&mut sys);
                 log::debug!(
-                    "motion pt=({x},{y}) entry=({ex},{ey}) delta=({dx},{dy}) sys_cursor=({},{})",
+                    "motion pt=({x},{y}) anchor=({ex},{ey}) delta=({dx},{dy}) sys_cursor=({},{})",
                     sys.x,
                     sys.y
                 );
@@ -630,15 +653,18 @@ unsafe fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
                 if CLIENTS.contains(&pending_pos) {
                     ACTIVE_CLIENT.replace(pending_pos);
                     ENTRY_POINT = entry;
+                    MOTION_ANCHOR = anchor_for_entry(entry, displays);
                     hide_indicator();
                     log::info!(
-                        "BEGIN (dwell motion): pos={pending_pos:?} entry=({},{})",
-                        entry.0,
-                        entry.1
+                        "BEGIN (dwell motion): pos={pending_pos:?} entry=({},{}) anchor=({},{})",
+                        entry.0, entry.1, MOTION_ANCHOR.0, MOTION_ANCHOR.1
                     );
                     send_blocking(CaptureEvent::Begin);
+                    warp_cursor_to(MOTION_ANCHOR);
                 }
-                return ACTIVE_CLIENT.is_some();
+                // 激活那一帧不转发 motion（curr_pos 在边角，pt - anchor 是巨大 offset）；
+                // 下一次用户输入时 cursor 已被 warp 到 anchor，delta 才是真实 raw delta。
+                return false;
             }
             // dwell 还没到，继续等
             return false;
@@ -677,12 +703,13 @@ unsafe fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
         // 原行为：立即激活
         ACTIVE_CLIENT.replace(pos);
         ENTRY_POINT = entry;
+        MOTION_ANCHOR = anchor_for_entry(entry, displays);
         log::info!(
-            "BEGIN (immediate): pos={pos:?} prev={prev_pos:?} curr={curr_pos:?} entry=({},{})",
-            entry.0,
-            entry.1
+            "BEGIN (immediate): pos={pos:?} prev={prev_pos:?} curr={curr_pos:?} entry=({},{}) anchor=({},{})",
+            entry.0, entry.1, MOTION_ANCHOR.0, MOTION_ANCHOR.1
         );
         send_blocking(CaptureEvent::Begin);
+        warp_cursor_to(MOTION_ANCHOR);
         return ret;
     }
 
@@ -695,6 +722,19 @@ unsafe fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
 }
 
 unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // 自注入的 SetCursorPos 触发的 hook fire —— sentinel 配对吃掉，不当用户输入。
+    if wparam.0 == WM_MOUSEMOVE as usize
+        && INJECTED_MOTION.load(Ordering::SeqCst) > 0
+    {
+        INJECTED_MOTION.fetch_sub(1, Ordering::SeqCst);
+        // 激活期间继续 swallow（不传给应用、不进 to_mouse_event）；
+        // 未激活时让事件正常传给应用（理论上不会到这条路径，但保险起见）。
+        if ACTIVE_CLIENT.is_some() {
+            return LRESULT(1);
+        }
+        return CallNextHookEx(HHOOK::default(), ncode, wparam, lparam);
+    }
+
     let active = check_client_activation(wparam, lparam);
 
     /* no client was active */
@@ -716,6 +756,17 @@ unsafe extern "system" fn mouse_proc(ncode: i32, wparam: WPARAM, lparam: LPARAM)
     /* notify mainthread (drop events if sending too fast) */
     if let Err(e) = EVENT_TX.as_ref().unwrap().try_send(event) {
         log::warn!("dropped capture event (channel full / closed): {e}");
+    }
+
+    // motion 后把系统光标 warp 回 MOTION_ANCHOR：下一帧 hook 拿到的 pt - anchor 就是
+    // 本帧 raw delta，避免 cursor 撞屏幕边后 pt 被 clamp 卡死。
+    // sentinel 计数器保证这次 warp 触发的递归 hook fire 不被当用户输入。
+    if wparam.0 == WM_MOUSEMOVE as usize {
+        let mouse_low_level: MSLLHOOKSTRUCT = *(lparam.0 as *const MSLLHOOKSTRUCT);
+        let pt = (mouse_low_level.pt.x, mouse_low_level.pt.y);
+        if pt != MOTION_ANCHOR {
+            warp_cursor_to(MOTION_ANCHOR);
+        }
     }
 
     /* don't pass event to applications */
