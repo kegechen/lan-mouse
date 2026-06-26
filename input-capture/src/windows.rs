@@ -222,10 +222,15 @@ fn rearm_ms() -> u64 {
 fn at_barrier(point: (i32, i32), displays: &[RECT]) -> Option<Position> {
     let display = displays.iter().find(|&d| is_within_dp_region(point, d))?;
     let (x, y) = point;
-    if x <= display.left { return Some(Position::Left); }
-    if x >= display.right - 1 { return Some(Position::Right); }
-    if y <= display.top { return Some(Position::Top); }
-    if y >= display.bottom - 1 { return Some(Position::Bottom); }
+    // 边缘容差：距离边界 <= BARRIER_TOL 像素都视为"贴边"。
+    // 原来 1px 太紧 —— dwell 期间 Windows 鼠标抖动 + 用户手抖只要偏离 1px，
+    // check_client_activation 的 still_at 判定就 false → cancel_pending 把倒计时
+    // 清零，结果"靠边总不容易触发倒计时"。TOL=2 给 3px 死区，匹配 1-2 像素体感。
+    const BARRIER_TOL: i32 = 2;
+    if x - display.left <= BARRIER_TOL { return Some(Position::Left); }
+    if (display.right - 1) - x <= BARRIER_TOL { return Some(Position::Right); }
+    if y - display.top <= BARRIER_TOL { return Some(Position::Top); }
+    if (display.bottom - 1) - y <= BARRIER_TOL { return Some(Position::Bottom); }
     None
 }
 
