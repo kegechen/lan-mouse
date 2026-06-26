@@ -154,6 +154,9 @@ const DWELL_TIMER_ID: usize = 0xD05E;
 // mouse 输入消息饿死的问题）。
 static mut PENDING_BARRIER: Option<(Position, (i32, i32), std::time::Instant)> = None;
 static mut MSG_HWND: HWND = HWND(std::ptr::null_mut());
+// 最近一次从远端释放回本机的 (方向, 时刻)；release-cooldown 用它判断是否在冷却期。
+// 与 ACTIVE_CLIENT 等一样只在 message_thread（LL hook 安装线程）访问，无需额外同步。
+static mut LAST_RELEASE: Option<(Position, std::time::Instant)> = None;
 
 fn dwell_ms() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -163,6 +166,47 @@ fn dwell_ms() -> u64 {
         return v;
     }
     let parsed = std::env::var("LAN_MOUSE_DWELL_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    CACHED.store(parsed, Ordering::Relaxed);
+    parsed
+}
+
+// === lan-mouse crossing-margin patch (借鉴 mykvm CROSSING_MARGIN) ===
+// 进入远端前要求光标越过【源屏边缘】>= N px（"穿越确认余量"），过滤"贴边/手抖
+// 擦边 1px 即误触发"。通过 LAN_MOUSE_ENTER_MARGIN 配置（默认 0 = 关闭）。
+// 只作用于 entered_barrier 立即穿越路径；dwell 的 at_barrier 兜底不受影响。
+// 注：一次真实越界 overshoot 恒 >= 1，所以 margin=0 时判定 >=0 永真 = 行为与今天一致。
+fn enter_margin() -> i32 {
+    use std::sync::atomic::{AtomicI32, Ordering};
+    static CACHED: AtomicI32 = AtomicI32::new(i32::MIN);
+    let v = CACHED.load(Ordering::Relaxed);
+    if v != i32::MIN {
+        return v;
+    }
+    let parsed = std::env::var("LAN_MOUSE_ENTER_MARGIN")
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+        .unwrap_or(0)
+        .max(0);
+    CACHED.store(parsed, Ordering::Relaxed);
+    parsed
+}
+
+// === lan-mouse release-cooldown patch (借鉴 mykvm hysteresis) ===
+// 从远端切回本机后，N ms 内不再自动激活"刚释放的那一侧"，防止释放瞬间贴边
+// 立刻又被吸回去来回横跳。通过 LAN_MOUSE_REARM_MS 配置（默认 0 = 关闭，永不阻塞）。
+// 注：因 MOTION_ANCHOR 每帧把光标 warp 回入口屏中心，释放后光标通常落在屏幕中央，
+// 该冷却在当前 Windows 实现里很少触发，属防御性补强（如 ping 超时/远端发起的释放）。
+fn rearm_ms() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CACHED: AtomicU64 = AtomicU64::new(u64::MAX);
+    let v = CACHED.load(Ordering::Relaxed);
+    if v != u64::MAX {
+        return v;
+    }
+    let parsed = std::env::var("LAN_MOUSE_REARM_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
@@ -677,17 +721,33 @@ unsafe fn check_client_activation(wparam: WPARAM, lparam: LPARAM) -> bool {
      *           LowLevelMouseProc 在某些 Win 版本拿到 post-clamp 坐标导致
      *           "越界但 entered_barrier 不 fire" 的问题
      */
+    // 穿越确认余量：只对 entered_barrier 立即穿越生效，要求越过源屏边缘 >= margin px。
+    // margin=0（默认）时 overshoot>=1 恒满足 → 等价原行为；at_barrier 兜底不过滤。
+    let margin = enter_margin();
+    let crossed = entered_barrier(prev_pos, curr_pos, displays)
+        .filter(|&p| crossing_overshoot(prev_pos, curr_pos, displays, p) >= margin);
     let pos = if dwell == 0 {
-        entered_barrier(prev_pos, curr_pos, displays)
+        crossed
     } else {
-        entered_barrier(prev_pos, curr_pos, displays)
-            .or_else(|| at_barrier(curr_pos, displays))
+        crossed.or_else(|| at_barrier(curr_pos, displays))
     };
     let Some(pos) = pos else {
         return ret;
     };
     if !CLIENTS.contains(&pos) {
         return ret;
+    }
+
+    // 释放冷却（re-arm）：刚切回本机后 rearm ms 内不再激活"同一侧"，防止释放瞬间
+    // 贴边立刻又被吸回去。rearm=0（默认）时整段跳过，永不阻塞。
+    let rearm = rearm_ms();
+    if rearm > 0 {
+        if let Some((rpos, when)) = LAST_RELEASE {
+            if rpos == pos && when.elapsed() < std::time::Duration::from_millis(rearm) {
+                log::debug!("re-arm cooldown active for {pos:?}");
+                return ret;
+            }
+        }
     }
 
     // 防御：at_barrier 兜底时 prev_pos 可能在屏幕外（pre-clamp 负坐标），
@@ -936,6 +996,27 @@ fn entered_barrier(
     .find(|&pos| moved_across_boundary(prev_pos, curr_pos, displays, pos))
 }
 
+/// 光标在方向 `pos` 上越过【源屏边缘】的像素数（穿越确认余量用）。
+/// 源屏 = 包含 `prev` 的 display。一次真实越界（entered_barrier 命中）该值恒 >= 1。
+/// `prev` 不在任何 display 内（罕见，如 at_barrier 兜底的屏外坐标）时返回 i32::MAX —
+/// 表示无法测量 → 不因余量阻塞（保持可穿越）。
+fn crossing_overshoot(
+    prev: (i32, i32),
+    curr: (i32, i32),
+    displays: &[RECT],
+    pos: Position,
+) -> i32 {
+    let Some(d) = displays.iter().find(|d| is_within_dp_region(prev, d)) else {
+        return i32::MAX;
+    };
+    match pos {
+        Position::Left => d.left - curr.0,
+        Position::Right => curr.0 - (d.right - 1),
+        Position::Top => d.top - curr.1,
+        Position::Bottom => curr.1 - (d.bottom - 1),
+    }
+}
+
 fn get_msg() -> Option<MSG> {
     unsafe {
         let mut msg = std::mem::zeroed();
@@ -1084,6 +1165,10 @@ fn message_thread(ready_tx: mpsc::Sender<()>) {
                     x if x == EventType::Release as usize => {
                         let was = ACTIVE_CLIENT.take();
                         log::info!("RELEASE: was_active={was:?}");
+                        // 记录释放方向+时刻，供 release-cooldown 判定（防止贴边瞬间重入同一侧）
+                        if let Some(p) = was {
+                            LAST_RELEASE = Some((p, std::time::Instant::now()));
+                        }
                         restore_cursor(); // 释放回 Windows 时恢复光标
                     }
                     x if x == EventType::Request as usize => {
