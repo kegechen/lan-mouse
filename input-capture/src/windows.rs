@@ -25,6 +25,10 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    VIRTUAL_KEY, VK_CAPITAL, VK_ESCAPE, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_RCONTROL,
+    VK_RMENU, VK_RSHIFT, VK_RWIN,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect,
     GetCursorPos, GetMessageW, KillTimer, LoadCursorW, PostThreadMessageW, RegisterClassW,
@@ -584,47 +588,70 @@ fn to_mouse_event(wparam: WPARAM, lparam: LPARAM) -> Option<PointerEvent> {
     }
 }
 
+/// VK 兜底：某些键盘驱动 / Win Mobile Hotspot / 远程会话场景下 KBDLLHOOKSTRUCT.scanCode
+/// 给的是 0（实测 RightAlt 在 Kylin uinput 链路里 raw scanCode=0），scancode 翻译失败
+/// release_bind 永远不命中。modifier 键的 vkCode 是稳定的，按 VK 直接映射 Linux scancode。
+fn vk_to_linux(vk: u16) -> Option<Linux> {
+    let v = VIRTUAL_KEY(vk);
+    Some(if v == VK_LMENU { Linux::KeyLeftAlt }
+    else if v == VK_RMENU { Linux::KeyRightalt }
+    else if v == VK_LCONTROL { Linux::KeyLeftCtrl }
+    else if v == VK_RCONTROL { Linux::KeyRightCtrl }
+    else if v == VK_LSHIFT { Linux::KeyLeftShift }
+    else if v == VK_RSHIFT { Linux::KeyRightShift }
+    else if v == VK_LWIN { Linux::KeyLeftMeta }
+    else if v == VK_RWIN { Linux::KeyRightmeta }
+    else if v == VK_CAPITAL { Linux::KeyCapsLock }
+    else if v == VK_ESCAPE { Linux::KeyEsc }
+    else { return None })
+}
+
 unsafe fn to_key_event(wparam: WPARAM, lparam: LPARAM) -> Option<KeyboardEvent> {
     let kybrdllhookstruct: KBDLLHOOKSTRUCT = *(lparam.0 as *const KBDLLHOOKSTRUCT);
+    // 先定 state；SYSKEYUP 原来误写成 state:1（Alt 键属 SYSKEY 路径，导致放手算成按下）
+    let state: u8 = if wparam.0 == WM_KEYDOWN as usize || wparam.0 == WM_SYSKEYDOWN as usize {
+        1
+    } else if wparam.0 == WM_KEYUP as usize || wparam.0 == WM_SYSKEYUP as usize {
+        0
+    } else {
+        return None;
+    };
+
     let mut scan_code = kybrdllhookstruct.scanCode;
-    log::trace!("scan_code: {scan_code}");
+    log::trace!("scan_code: {scan_code} vk: {:#x} flags: {:?}", kybrdllhookstruct.vkCode, kybrdllhookstruct.flags);
     if kybrdllhookstruct.flags.contains(LLKHF_EXTENDED) {
         scan_code |= 0xE000;
     }
-    let Ok(win_scan_code) = scancode::Windows::try_from(scan_code) else {
-        log::warn!("failed to translate to windows scancode: {scan_code}");
-        return None;
+
+    // 主路径：raw scancode → Windows enum → Linux scancode
+    let linux_scan_code = match scancode::Windows::try_from(scan_code) {
+        Ok(win_sc) => {
+            log::trace!("windows_scan: {win_sc:?}");
+            match Linux::try_from(win_sc) {
+                Ok(l) => Some(l),
+                Err(_) => {
+                    log::warn!("no Linux mapping for windows scancode {win_sc:?}");
+                    None
+                }
+            }
+        }
+        Err(_) => None,
     };
-    log::trace!("windows_scan: {win_scan_code:?}");
-    let Ok(linux_scan_code): Result<Linux, ()> = win_scan_code.try_into() else {
-        log::warn!("failed to translate into linux scancode: {win_scan_code:?}");
-        return None;
-    };
-    log::trace!("windows_scan: {linux_scan_code:?}");
-    let scan_code = linux_scan_code as u32;
-    match wparam {
-        WPARAM(p) if p == WM_KEYDOWN as usize => Some(KeyboardEvent::Key {
-            time: 0,
-            key: scan_code,
-            state: 1,
-        }),
-        WPARAM(p) if p == WM_KEYUP as usize => Some(KeyboardEvent::Key {
-            time: 0,
-            key: scan_code,
-            state: 0,
-        }),
-        WPARAM(p) if p == WM_SYSKEYDOWN as usize => Some(KeyboardEvent::Key {
-            time: 0,
-            key: scan_code,
-            state: 1,
-        }),
-        WPARAM(p) if p == WM_SYSKEYUP as usize => Some(KeyboardEvent::Key {
-            time: 0,
-            key: scan_code,
-            state: 1,
-        }),
-        _ => None,
-    }
+
+    // 兜底：scancode 翻译失败 → 用 vkCode 找 modifier。命中也算合法事件，不再丢弃。
+    let linux_scan_code = linux_scan_code.or_else(|| {
+        let vk = kybrdllhookstruct.vkCode as u16;
+        let fallback = vk_to_linux(vk);
+        if let Some(l) = fallback {
+            log::debug!("scancode {scan_code} 未映射，vkCode {vk:#x} 兜底 → {l:?}");
+        } else {
+            log::warn!("failed to translate to windows scancode: {scan_code} (vk={vk:#x})");
+        }
+        fallback
+    })?;
+
+    log::trace!("linux_scan: {linux_scan_code:?} state={state}");
+    Some(KeyboardEvent::Key { time: 0, key: linux_scan_code as u32, state })
 }
 
 ///
