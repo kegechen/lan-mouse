@@ -1,3 +1,8 @@
+# 独立于上级 lan-mouse workspace 编译：clipsync 有自己的依赖集（arboard 等），
+# 不属于根 [workspace].members。空 [workspace] 表让 cargo 把本 crate 当独立
+# workspace root，`cargo build` 时不再向上误并入 lan-mouse 主 workspace。
+[workspace]
+
 [package]
 name = "clipsync"
 version = "0.1.0"
