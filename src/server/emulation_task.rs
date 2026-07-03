@@ -95,20 +95,22 @@ async fn do_emulation_session(
     loop {
         tokio::select! {
             udp_event = udp_rx.recv() => {
-                let udp_event = match udp_event.expect("channel closed") {
-                    Ok(e) => e,
-                    Err(e) => {
+                let udp_event = match udp_event {
+                    Some(Ok(e)) => e,
+                    Some(Err(e)) => {
                         log::warn!("network error: {e}");
                         continue;
                     }
+                    None => break Ok(()), /* channel closed → clean exit */
                 };
                 handle_incoming_event(server, emulation, sender_tx, &mut last_ignored, udp_event).await?;
             }
             emulate_event = rx.recv() => {
-                match emulate_event.expect("channel closed") {
-                    EmulationRequest::Create(h) => { let _ = emulation.create(h).await; },
-                    EmulationRequest::Destroy(h) => emulation.destroy(h).await,
-                    EmulationRequest::ReleaseKeys(c) => emulation.release_keys(c).await?,
+                match emulate_event {
+                    Some(EmulationRequest::Create(h)) => { let _ = emulation.create(h).await; },
+                    Some(EmulationRequest::Destroy(h)) => emulation.destroy(h).await,
+                    Some(EmulationRequest::ReleaseKeys(c)) => emulation.release_keys(c).await?,
+                    None => break Ok(()), /* channel closed → clean exit */
                 }
             }
             _ = server.notifies.cancel.cancelled() => break Ok(()),
@@ -150,9 +152,7 @@ async fn handle_incoming_event(
         (ProtoEvent::Enter(_), _) => {
             log::info!("got Enter from {addr} → state=Receiving (this releases pointer back to Windows)");
             server.set_state(State::Receiving);
-            sender_tx
-                .send((ProtoEvent::Ack(0), addr))
-                .expect("no channel")
+            let _ = sender_tx.send((ProtoEvent::Ack(0), addr));
         }
         (ProtoEvent::Input(e), _) => {
             if let State::Receiving = server.get_state() {

@@ -37,7 +37,15 @@ impl DnsResolver {
 
     async fn do_dns(&mut self, server: &Server) {
         loop {
-            let handle = self.dns_request.recv().await.expect("channel closed");
+            let handle = match self.dns_request.recv().await {
+                Some(handle) => handle,
+                None => {
+                    // request channel closed → end cleanly (the outer select!
+                    // treats this return as a break condition).
+                    log::warn!("dns request channel closed → exiting dns resolver");
+                    return;
+                }
+            };
 
             /* update resolving status */
             let hostname = match server.get_hostname(handle) {

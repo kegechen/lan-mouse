@@ -150,7 +150,10 @@ impl Server {
         );
 
         for handle in self.active_clients() {
-            dns_tx.send(handle).expect("channel closed");
+            if dns_tx.send(handle).is_err() {
+                log::warn!("dns channel closed → skipping initial dns resolution");
+                break;
+            }
         }
 
         loop {
@@ -187,7 +190,18 @@ impl Server {
         log::info!("terminating service");
 
         self.cancel();
-        let _ = join!(capture, dns_task, emulation, network, ping);
+        let results = join!(capture, dns_task, emulation, network, ping);
+        for (name, res) in [
+            ("capture", results.0),
+            ("dns", results.1),
+            ("emulation", results.2),
+            ("network", results.3),
+            ("ping", results.4),
+        ] {
+            if let Err(e) = res {
+                log::error!("{name} task did not exit cleanly: {e}");
+            }
+        }
 
         Ok(())
     }
@@ -294,7 +308,11 @@ impl Server {
             FrontendRequest::UpdatePosition(handle, pos) => {
                 self.update_pos(handle, capture, emulate, pos)
             }
-            FrontendRequest::ResolveDns(handle) => dns.send(handle).expect("channel closed"),
+            FrontendRequest::ResolveDns(handle) => {
+                if dns.send(handle).is_err() {
+                    log::warn!("dns channel closed → ignoring ResolveDns request");
+                }
+            }
             FrontendRequest::Sync => {
                 self.enumerate();
                 self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status.get()));
@@ -447,7 +465,9 @@ impl Server {
             s.dns_ips.clear();
             drop(client_manager);
             self.update_ips(handle);
-            dns.send(handle).expect("channel closed");
+            if dns.send(handle).is_err() {
+                log::warn!("dns channel closed → skipping dns resolution for updated hostname");
+            }
         }
         self.client_updated(handle);
     }

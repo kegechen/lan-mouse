@@ -92,7 +92,11 @@ async fn do_capture(
     loop {
         tokio::select! {
             event = capture.next() => match event {
-                Some(event) => handle_capture_event(server, &mut capture, sender_tx, event?).await?,
+                Some(event) => {
+                    if !handle_capture_event(server, &mut capture, sender_tx, event?).await? {
+                        break;
+                    }
+                }
                 None => return Ok(()),
             },
             e = notify_rx.recv() => {
@@ -122,7 +126,7 @@ async fn handle_capture_event(
     capture: &mut InputCapture,
     sender_tx: &Sender<(ProtoEvent, SocketAddr)>,
     event: (CaptureHandle, CaptureEvent),
-) -> Result<(), CaptureError> {
+) -> Result<bool, CaptureError> {
     let (handle, event) = event;
     log::trace!("({handle}) {event:?}");
 
@@ -141,7 +145,7 @@ async fn handle_capture_event(
     if server.get_state() == State::Receiving {
         log::info!("state==Receiving on capture event {event:?} → capture.release() (someone flipped state)");
         capture.release().await?;
-        return Ok(());
+        return Ok(true);
     }
 
     // check release bind
@@ -162,10 +166,17 @@ async fn handle_capture_event(
             /* released capture */
             State::Receiving => ProtoEvent::Leave(0),
         };
-        sender_tx.send((event, addr)).expect("sender closed");
+        if sender_tx.send((event, addr)).is_err() {
+            // network task exited first (udp_send_rx dropped); release the
+            // pointer if we just acquired it, then signal a clean loop exit
+            // so the normal teardown path (capture.terminate()) still runs.
+            log::warn!("sender channel closed → releasing capture and exiting capture loop");
+            capture.release().await?;
+            return Ok(false);
+        }
     };
 
-    Ok(())
+    Ok(true)
 }
 
 fn spawn_hook_command(server: &Server, handle: ClientHandle) {
