@@ -10,6 +10,14 @@ port = 4242
 # optional frontend -> defaults to gtk if available
 # frontend = "gtk"
 
+# Pre-shared key for HMAC-SHA256 peer authentication.
+# All peers must use the exact same string.  The raw UTF-8 bytes of this
+# value are used as the HMAC key.  Can also be set via the LAN_MOUSE_AUTH_KEY
+# environment variable (which takes precedence).
+# WARNING: when this is absent the server operates in FAIL-CLOSED mode —
+# all remote UDP events are silently rejected.
+# authentication_key = "change-me-to-a-strong-secret"
+
 # define a client on the right side with host name "iridium"
 [right]
 # hostname

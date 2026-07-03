@@ -1,11 +1,20 @@
+use hmac::{Hmac, Mac};
 use input_event::{Event as InputEvent, KeyboardEvent, PointerEvent};
 use num_enum::{IntoPrimitive, TryFromPrimitive, TryFromPrimitiveError};
 use paste::paste;
+use sha2::Sha256;
 use std::{
     fmt::{Debug, Display},
     mem::size_of,
 };
 use thiserror::Error;
+
+type HmacSha256 = Hmac<Sha256>;
+
+/// Size of the HMAC-SHA256 authentication tag in bytes.
+pub const HMAC_TAG_SIZE: usize = 32;
+/// Size of the monotonic counter prefix in bytes (u64 big-endian).
+pub const COUNTER_SIZE: usize = size_of::<u64>();
 
 /// defines the maximum size an encoded event can take up
 /// this is currently the pointer motion event
@@ -18,6 +27,12 @@ pub enum ProtocolError {
     /// event type does not exist
     #[error("invalid event id: `{0}`")]
     InvalidEventId(#[from] TryFromPrimitiveError<EventType>),
+    /// datagram too short or too long for authenticated wire format
+    #[error("bad datagram length: {0}")]
+    BadLength(usize),
+    /// HMAC-SHA256 verification failed (forged, corrupted, or wrong key)
+    #[error("authentication failed")]
+    AuthenticationFailed,
 }
 
 /// main lan-mouse protocol event type
@@ -249,3 +264,173 @@ encode_impl!(u8);
 encode_impl!(u32);
 encode_impl!(i32);
 encode_impl!(f64);
+
+// ---------------------------------------------------------------------------
+// Authenticated wire format
+// ---------------------------------------------------------------------------
+//
+// Layout: [ counter: 8 bytes BE ] [ event_bytes: 1..MAX_EVENT_SIZE ] [ HMAC-SHA256 tag: 32 bytes ]
+//
+// The HMAC is computed over counter_bytes || event_bytes (everything except the
+// tag itself).  `event_bytes` is the existing ProtoEvent encoding (variable
+// length).
+
+/// Minimum authenticated datagram size: counter + 1 byte event + tag.
+pub const MIN_AUTH_DATAGRAM: usize = COUNTER_SIZE + 1 + HMAC_TAG_SIZE;
+/// Maximum authenticated datagram size: counter + MAX_EVENT_SIZE + tag.
+pub const MAX_AUTH_DATAGRAM: usize = COUNTER_SIZE + MAX_EVENT_SIZE + HMAC_TAG_SIZE;
+
+/// Encode a `ProtoEvent` into the authenticated wire format.
+///
+/// Returns a buffer and its used length.  The caller should transmit
+/// `&buf[..len]`.
+pub fn encode_authenticated(
+    event: &ProtoEvent,
+    key: &[u8],
+    counter: u64,
+) -> ([u8; MAX_AUTH_DATAGRAM], usize) {
+    // Serialize the event via the existing path.
+    let (event_buf, event_len): ([u8; MAX_EVENT_SIZE], usize) = (*event).into();
+
+    let mut buf = [0u8; MAX_AUTH_DATAGRAM];
+    let counter_bytes = counter.to_be_bytes();
+
+    // 1. Write counter.
+    buf[..COUNTER_SIZE].copy_from_slice(&counter_bytes);
+    // 2. Write event bytes.
+    buf[COUNTER_SIZE..COUNTER_SIZE + event_len].copy_from_slice(&event_buf[..event_len]);
+
+    let payload_end = COUNTER_SIZE + event_len;
+
+    // 3. Compute HMAC-SHA256 over counter || event_bytes.
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(&buf[..payload_end]);
+    let tag = mac.finalize().into_bytes();
+
+    // 4. Append tag.
+    buf[payload_end..payload_end + HMAC_TAG_SIZE].copy_from_slice(&tag);
+
+    (buf, payload_end + HMAC_TAG_SIZE)
+}
+
+/// Decode and authenticate a datagram received from the network.
+///
+/// `datagram` must be exactly `&recv_buf[..actual_recv_len]` — the ACTUAL
+/// number of bytes returned by `recv_from`, NOT a zero-padded fixed buffer.
+///
+/// On success returns `(counter, ProtoEvent)`.  On failure returns a
+/// `ProtocolError` — the caller MUST drop the packet.
+pub fn decode_authenticated(
+    datagram: &[u8],
+    key: &[u8],
+) -> Result<(u64, ProtoEvent), ProtocolError> {
+    let len = datagram.len();
+
+    // --- length check (closes #9: no more fixed-size zero-padded buffer) ---
+    if len < MIN_AUTH_DATAGRAM || len > MAX_AUTH_DATAGRAM {
+        return Err(ProtocolError::BadLength(len));
+    }
+
+    let tag_start = len - HMAC_TAG_SIZE;
+    let payload = &datagram[..tag_start]; // counter || event_bytes
+    let tag = &datagram[tag_start..];
+
+    // --- HMAC verification (constant-time, closes #1/#18: forged packets rejected) ---
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(payload);
+    mac.verify_slice(tag).map_err(|_| ProtocolError::AuthenticationFailed)?;
+
+    // --- parse counter ---
+    let counter = u64::from_be_bytes(
+        payload[..COUNTER_SIZE]
+            .try_into()
+            .expect("COUNTER_SIZE == 8"),
+    );
+
+    // --- parse event (only after authentication succeeds) ---
+    let event_bytes = &payload[COUNTER_SIZE..];
+    // The existing TryFrom<[u8; MAX_EVENT_SIZE]> expects a fixed-size array
+    // padded with zeros.  Build one from the variable-length slice.
+    let mut event_buf = [0u8; MAX_EVENT_SIZE];
+    let copy_len = event_bytes.len().min(MAX_EVENT_SIZE);
+    event_buf[..copy_len].copy_from_slice(&event_bytes[..copy_len]);
+    let event = ProtoEvent::try_from(event_buf)?;
+
+    Ok((counter, event))
+}
+
+// ---------------------------------------------------------------------------
+// Anti-replay sliding window (WireGuard / IPsec style)
+// ---------------------------------------------------------------------------
+
+/// Sliding-window replay filter for authenticated counters.
+///
+/// Tracks the highest accepted counter and a 64-bit bitmap of recently seen
+/// offsets below it.  This rejects duplicate and out-of-order-beyond-window
+/// packets even if they carry a valid HMAC (recorded replay attack).
+pub struct ReplayWindow {
+    /// Highest counter value accepted so far.  `None` means no packet has been
+    /// accepted yet.
+    highest: Option<u64>,
+    /// Bitmap: bit `i` is set if `(highest - 1 - i)` has been seen,
+    /// for `i` in `0..63`.  This covers the 64 counters immediately below
+    /// `highest`.
+    bitmap: u64,
+}
+
+impl ReplayWindow {
+    /// Window size (number of counters below `highest` that are tracked).
+    const WINDOW_SIZE: u64 = 64;
+
+    pub fn new() -> Self {
+        Self {
+            highest: None,
+            bitmap: 0,
+        }
+    }
+
+    /// Check whether `counter` is acceptable (not a replay) and, if so,
+    /// record it.  Returns `true` if the packet should be accepted.
+    pub fn check_and_record(&mut self, counter: u64) -> bool {
+        let Some(highest) = self.highest else {
+            // First packet ever — accept unconditionally.
+            self.highest = Some(counter);
+            return true;
+        };
+
+        if counter > highest {
+            // New high-water mark.  Shift the bitmap to account for the gap.
+            let shift = counter - highest;
+            if shift < Self::WINDOW_SIZE {
+                self.bitmap = (self.bitmap << shift) | (1u64 << (shift - 1));
+            } else {
+                // Gap exceeds window — everything old falls out.
+                self.bitmap = 0;
+            }
+            self.highest = Some(counter);
+            return true;
+        }
+
+        if counter == highest {
+            // Exact duplicate of the highest — replay.
+            return false;
+        }
+
+        // counter < highest
+        let offset = highest - counter; // >= 1
+        if offset > Self::WINDOW_SIZE {
+            // Too old — outside the window.
+            return false;
+        }
+
+        let bit = 1u64 << (offset - 1);
+        if self.bitmap & bit != 0 {
+            // Already seen — replay.
+            return false;
+        }
+
+        // Accept and record.
+        self.bitmap |= bit;
+        true
+    }
+}

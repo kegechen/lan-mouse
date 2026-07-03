@@ -22,6 +22,11 @@ pub struct ConfigToml {
     pub port: Option<u16>,
     pub frontend: Option<Frontend>,
     pub release_bind: Option<Vec<scancode::Linux>>,
+    /// Pre-shared key for HMAC-SHA256 peer authentication.
+    /// The raw UTF-8 bytes of this string are used as the HMAC key.
+    /// Both peers MUST use the same value.  When absent, the server
+    /// operates in fail-closed mode: all remote events are rejected.
+    pub authentication_key: Option<String>,
     pub left: Option<TomlClient>,
     pub right: Option<TomlClient>,
     pub top: Option<TomlClient>,
@@ -233,6 +238,9 @@ pub struct Config {
     pub release_bind: Vec<scancode::Linux>,
     pub test_capture: bool,
     pub test_emulation: bool,
+    /// Pre-shared key bytes for HMAC-SHA256 peer authentication.
+    /// `None` means fail-closed: all remote UDP events are rejected.
+    pub authentication_key: Option<Vec<u8>>,
 }
 
 pub struct ConfigClient {
@@ -310,6 +318,17 @@ impl Config {
             .emulation_backend
             .or(config_toml.as_ref().and_then(|c| c.emulation_backend));
 
+        // authentication_key: read from config, convert UTF-8 string to raw bytes.
+        // Also check the LAN_MOUSE_AUTH_KEY environment variable as an override.
+        let authentication_key = env::var("LAN_MOUSE_AUTH_KEY")
+            .ok()
+            .or_else(|| {
+                config_toml
+                    .as_ref()
+                    .and_then(|c| c.authentication_key.clone())
+            })
+            .map(|s| s.into_bytes());
+
         let mut clients: Vec<(TomlClient, Position)> = vec![];
 
         if let Some(config_toml) = config_toml {
@@ -341,6 +360,7 @@ impl Config {
             release_bind,
             test_capture,
             test_emulation,
+            authentication_key,
         })
     }
 
