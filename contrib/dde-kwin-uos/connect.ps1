@@ -414,6 +414,7 @@ authentication_key = "$($script:ResolvedAuthKey)"
 hostname = "win-host"
 ips = ["$($script:ResolvedWinHostIp)"]
 port = $($script:ResolvedPort)
+activate_on_startup = true
 "@
     $tmpCfg = Join-Path $env:TEMP 'lan-mouse-uos-config.toml'
     [System.IO.File]::WriteAllText($tmpCfg, $uosCfg, [System.Text.UTF8Encoding]::new($false))
@@ -614,6 +615,7 @@ authentication_key = "$($script:ResolvedAuthKey)"
 hostname = "win-host"
 ips = ["$($script:ResolvedWinHostIp)"]
 port = $($script:ResolvedPort)
+activate_on_startup = true
 "@
     # Linux 文件统一 LF：避免 here-string 的 CRLF 跟 UOS 端原 LF 文件 cmp 永远不等，
     # 每次跑都"误判变化"重启 daemon。
@@ -701,6 +703,7 @@ authentication_key = "$($script:ResolvedAuthKey)"
 hostname = "$($script:ResolvedHostname)"
 ips = ["$($script:ResolvedTarget -replace '^.*@','' -replace ':.*$','')"]
 port = $($script:ResolvedPort)
+activate_on_startup = true
 "@
     [System.IO.File]::WriteAllText($WinCfg, $localCfg, [System.Text.UTF8Encoding]::new($false))
     Write-Sub "Windows config: $WinCfg"
