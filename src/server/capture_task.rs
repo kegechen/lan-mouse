@@ -1,7 +1,7 @@
 use futures::StreamExt;
 use lan_mouse_proto::ProtoEvent;
 use local_channel::mpsc::{Receiver, Sender};
-use std::net::SocketAddr;
+use std::{collections::HashSet, net::SocketAddr};
 
 use tokio::{process::Command, task::JoinHandle};
 
@@ -73,20 +73,25 @@ async fn do_capture(
 
     server.set_capture_status(Status::Enabled);
 
-    let clients = server.active_clients();
-    let clients = clients.iter().copied().map(|handle| {
-        (
-            handle,
-            server
-                .client_manager
-                .borrow()
-                .get(handle)
-                .map(|(c, _)| c.pos)
-                .expect("no such client"),
-        )
-    });
-    for (handle, pos) in clients {
-        capture.create(handle, to_capture_pos(pos)).await?;
+    // Tracks which capture handles currently have an edge barrier, so that
+    // Create/Destroy requests are idempotent (InputCapture::create panics on a
+    // duplicate handle and destroy expects an existing one). Reset on every
+    // (re)start of capture, matching the fresh InputCapture instance.
+    let mut created: HashSet<CaptureHandle> = HashSet::new();
+
+    // Only create barriers for clients that are both active and connected;
+    // the keepalive task adds the rest once their peers respond.
+    let initial: Vec<(CaptureHandle, Position)> = {
+        let client_manager = server.client_manager.borrow();
+        client_manager
+            .get_client_states()
+            .filter(|(_, (_, s))| s.active && s.connected)
+            .map(|(h, (c, _))| (h, to_capture_pos(c.pos)))
+            .collect()
+    };
+    for (handle, pos) in initial {
+        capture.create(handle, pos).await?;
+        created.insert(handle);
     }
 
     loop {
@@ -108,8 +113,18 @@ async fn do_capture(
                             capture.release().await?;
                             server.state.replace(State::Receiving);
                         }
-                        CaptureRequest::Create(h, p) => capture.create(h, p).await?,
-                        CaptureRequest::Destroy(h) => capture.destroy(h).await?,
+                        CaptureRequest::Create(h, p) => {
+                            // de-dup: only create if we don't already have it
+                            if created.insert(h) {
+                                capture.create(h, p).await?;
+                            }
+                        }
+                        CaptureRequest::Destroy(h) => {
+                            // de-dup: only destroy a barrier that actually exists
+                            if created.remove(&h) {
+                                capture.destroy(h).await?;
+                            }
+                        }
                     },
                     None => break,
                 }
@@ -132,6 +147,15 @@ async fn handle_capture_event(
 
     // capture started
     if event == CaptureEvent::Begin {
+        // Safety net: never lock the pointer for a client that is not
+        // currently connected. The barrier should already be absent for
+        // offline clients, but this guards the race where the pointer reaches
+        // the edge in the instant before the keepalive task tears it down.
+        if !server.is_connected(handle) {
+            log::info!("({handle}) capture begin but client not connected → releasing immediately");
+            capture.release().await?;
+            return Ok(true);
+        }
         // wait for remote to acknowlegde enter
         server.set_state(State::AwaitAck);
         server.set_active(Some(handle));

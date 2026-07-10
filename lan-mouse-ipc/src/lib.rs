@@ -152,6 +152,16 @@ pub struct ClientState {
     pub active_addr: Option<SocketAddr>,
     /// tracks whether or not the client is responding to pings
     pub alive: bool,
+    /// peer is currently reachable, maintained by the background keepalive
+    /// task. Edge capture barriers are only created for clients that are both
+    /// `active` and `connected`, so an offline direction does not grab/lock
+    /// the pointer when the mouse reaches that screen edge.
+    pub connected: bool,
+    /// transient: set whenever any datagram is received from the client and
+    /// reset at the start of every keepalive round. Lets the keepalive task
+    /// detect responses without disturbing the session-ping `alive` flag.
+    #[serde(skip)]
+    pub responded: bool,
     /// ips from dns
     pub dns_ips: Vec<IpAddr>,
     /// all ip addresses associated with a particular client

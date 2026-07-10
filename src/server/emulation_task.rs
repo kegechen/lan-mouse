@@ -189,6 +189,8 @@ fn activate_client_if_exists(
 
     // reset ttl for client
     client_state.alive = true;
+    // mark that we heard from this client this keepalive round
+    client_state.responded = true;
     // set addr as new default for this client
     client_state.active_addr = Some(addr);
     Some(handle)

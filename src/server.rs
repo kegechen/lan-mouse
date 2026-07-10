@@ -24,6 +24,7 @@ use lan_mouse_ipc::{
 
 mod capture_task;
 mod emulation_task;
+mod keepalive_task;
 mod network_task;
 mod ping_task;
 
@@ -149,6 +150,15 @@ impl Server {
             capture_tx.clone(),
         );
 
+        // background keepalive: maintains per-client `connected` state and
+        // creates/destroys edge barriers so offline directions never grab the
+        // pointer.
+        let keepalive = keepalive_task::new(
+            self.clone(),
+            udp_send_tx.clone(),
+            capture_tx.clone(),
+        );
+
         for handle in self.active_clients() {
             if dns_tx.send(handle).is_err() {
                 log::warn!("dns channel closed → skipping initial dns resolution");
@@ -190,13 +200,14 @@ impl Server {
         log::info!("terminating service");
 
         self.cancel();
-        let results = join!(capture, dns_task, emulation, network, ping);
+        let results = join!(capture, dns_task, emulation, network, ping, keepalive);
         for (name, res) in [
             ("capture", results.0),
             ("dns", results.1),
             ("emulation", results.2),
             ("network", results.3),
             ("ping", results.4),
+            ("keepalive", results.5),
         ] {
             if let Err(e) = res {
                 log::error!("{name} task did not exit cleanly: {e}");
@@ -270,6 +281,48 @@ impl Server {
             .filter(|(_, (_, s))| s.active)
             .map(|(h, _)| h)
             .collect()
+    }
+
+    /// Reconcile the edge capture barrier for `handle`: it must exist iff the
+    /// client is both `active` and `connected`. The capture task de-duplicates
+    /// redundant Create/Destroy requests, so this is safe to call on every
+    /// activation, deactivation, or connectivity transition.
+    fn ensure_barrier(&self, capture: &Sender<CaptureRequest>, handle: ClientHandle) {
+        let desired = self
+            .client_manager
+            .borrow()
+            .get(handle)
+            .map(|(c, s)| (s.active && s.connected, c.pos));
+        match desired {
+            Some((true, pos)) => {
+                let _ = capture.send(CaptureRequest::Create(handle, to_capture_pos(pos)));
+            }
+            Some((false, _)) => {
+                let _ = capture.send(CaptureRequest::Destroy(handle));
+            }
+            None => {}
+        }
+    }
+
+    fn is_connected(&self, handle: ClientHandle) -> bool {
+        self.client_manager
+            .borrow()
+            .get(handle)
+            .map(|(_, s)| s.connected)
+            .unwrap_or(false)
+    }
+
+    /// The client that is the current in-session sending target (state
+    /// `Sending` or `AwaitAck`), if any. The keepalive task must not touch this
+    /// client's barrier: `ping_task` owns its liveness and release with the
+    /// tuned WiFi-tolerance window, and tearing the barrier down mid-session
+    /// (via `Destroy`, which skips cursor/grab restoration) would drop a live
+    /// roam. In `Receiving` there is no sending session, so this is `None`.
+    fn active_sending_client(&self) -> Option<ClientHandle> {
+        match self.state.get() {
+            State::Receiving => None,
+            State::Sending | State::AwaitAck => self.active_client.get(),
+        }
     }
 
     fn handle_request(
@@ -353,7 +406,8 @@ impl Server {
             Some((_, s)) => s.active = false,
         };
 
-        let _ = capture.send(CaptureRequest::Destroy(handle));
+        // active is now false → ensure_barrier tears the edge barrier down.
+        self.ensure_barrier(capture, handle);
         let _ = emulate.send(EmulationRequest::Destroy(handle));
         self.client_updated(handle);
         log::info!("deactivated client {handle}");
@@ -385,7 +439,9 @@ impl Server {
         };
 
         /* notify emulation, capture and frontends */
-        let _ = capture.send(CaptureRequest::Create(handle, to_capture_pos(pos)));
+        // Only create the edge barrier if the peer is currently reachable;
+        // otherwise the keepalive task will create it once the peer responds.
+        self.ensure_barrier(capture, handle);
         let _ = emulate.send(EmulationRequest::Create(handle));
 
         self.client_updated(handle);
