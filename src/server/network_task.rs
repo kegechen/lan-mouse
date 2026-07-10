@@ -1,5 +1,11 @@
 use local_channel::mpsc::{Receiver, Sender};
-use std::{cell::Cell, collections::HashMap, io, net::SocketAddr};
+use std::{
+    cell::Cell,
+    collections::HashMap,
+    io,
+    net::SocketAddr,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use thiserror::Error;
 use tokio::{net::UdpSocket, task::JoinHandle};
@@ -33,7 +39,23 @@ pub(crate) async fn new(
 
     Ok(tokio::task::spawn_local(async move {
         // Monotonically increasing counter for outgoing datagrams.
-        let send_counter: Cell<u64> = Cell::new(0);
+        //
+        // Seed it with the current wall-clock time (µs since the UNIX epoch)
+        // instead of 0. The counter must be strictly increasing across
+        // *restarts*, not just within a single run: a peer's anti-replay window
+        // persists while we are down, so a fresh 0-based counter would be
+        // rejected as a replay ("too old", outside the window) until it climbed
+        // back past the peer's stored high-water mark — which silently broke the
+        // link after restarting only one side. Seeding from wall-clock µs makes
+        // the new counter start above the previous run's highest (as long as the
+        // clock advanced and we send < 1e6 datagrams/s), so a still-running peer
+        // accepts us immediately. We still increment by 1 per datagram, keeping
+        // the receiver window's 64-wide reordering tolerance intact.
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(0);
+        let send_counter: Cell<u64> = Cell::new(seed);
         // Per-peer replay windows for incoming datagrams, keyed by source address.
         let mut replay_windows: HashMap<SocketAddr, ReplayWindow> = HashMap::new();
 
