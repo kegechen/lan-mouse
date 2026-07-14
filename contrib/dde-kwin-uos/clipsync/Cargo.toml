@@ -13,6 +13,10 @@ description = "Tiny bidirectional text clipboard sync between Windows and Linux/
 clap = { version = "4", features = ["derive"] }
 log = "0.4"
 env_logger = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hmac = "0.12"
+sha2 = "0.10"
 tokio = { version = "1", features = [
     "rt",
     "rt-multi-thread",
@@ -23,10 +27,35 @@ tokio = { version = "1", features = [
     "macros",
     "process",
     "signal",
+    "fs",
 ] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [target.'cfg(windows)'.dependencies]
 arboard = "3"
+# 高层 `windows` crate（含 `#[implement]` 能实现 COM 接口）供文件传输的
+# COM 侧（IDataObject / IStream / OleSetClipboard）使用。arboard 只带 raw
+# FFI 的 `windows-sys`，无法 implement COM 接口，故单独引入本 crate。
+# 锁定版本：windows 0.62.2（由 `cargo add` 解析，见 Cargo.lock）。
+# 后续所有 COM 任务的符号/签名核对，均以 0.62.2 的 docs.rs 为准。
+windows = { version = "0.62.2", features = [
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_Graphics_Gdi",
+    "Win32_Foundation",
+    "Win32_System_SystemServices",
+] }
+# `#[implement]` 展开出的代码引用 `::windows_core::...` 路径，需要 `windows-core`
+# 作为 crate-root 直接依赖才能解析（否则 E0433: cannot find `windows_core`）。
+# 版本与 windows 0.62.2 传递依赖的 windows-core 0.62.2 一致，不改锁定版本。
+windows-core = "0.62.2"
 
 [profile.release]
 strip = true
