@@ -87,6 +87,7 @@ param(
     [string]$AuthKey,
     [int]$DwellMs,
     [int]$ClipsyncPort = 4243,
+    [int]$FileDataPort = 4645,
     [switch]$NoClipsync,
     [switch]$DemoIndicator,
     [switch]$Setup,
@@ -569,10 +570,34 @@ ls -la "$HOME/.cargo/bin/lan-mouse"
 # ---------- start remote daemon ----------
 function Start-RemoteClipsync {
     if ($NoClipsync) { return }
-    Write-Step "启动远端 clipsync (listen :$($script:ResolvedClipsyncPort))"
-    $port = $script:ResolvedClipsyncPort
-    # 用 here-string + bash -s 方式喂脚本，避免 ssh 单行命令对 ; & 的 quote bug
-    # WAYLAND_DISPLAY 必须显式 export — ssh non-interactive shell 不继承 wayland session
+    Write-Step "启动远端 clipsync (listen :$($script:ResolvedClipsyncPort), 文件数据端口 :$($script:ResolvedFileDataPort))"
+    $port     = $script:ResolvedClipsyncPort
+    $fileport = $script:ResolvedFileDataPort
+    $key      = $script:ResolvedAuthKey
+
+    # 固化：把本机暂存的 aarch64 静态 clipsync 推到远端 ~/.cargo/bin/clipsync。
+    # 远端无 rust，原“远端从源码 build”路径已失效，故改推预编译静态二进制（bin\clipsync-linux-aarch64）。
+    # 仅当远端是 aarch64、本地暂存存在、且 SHA 与远端不一致时才推（幂等、省流量）。
+    $staged = Join-Path $WinBinDir 'clipsync-linux-aarch64'
+    if (Test-Path $staged) {
+        $arch = (Invoke-Ssh "uname -m" | Out-String).Trim()
+        if ($arch -match 'aarch64') {
+            $localSha  = (Get-FileHash $staged -Algorithm SHA256).Hash.ToLower()
+            $remoteSha = (Invoke-Ssh "sha256sum ~/.cargo/bin/clipsync 2>/dev/null | cut -d' ' -f1" | Out-String).Trim().ToLower()
+            if ($localSha -ne $remoteSha) {
+                Write-Sub "推送 aarch64 clipsync -> 远端 ~/.cargo/bin/clipsync"
+                Invoke-Ssh "mkdir -p ~/.cargo/bin" | Out-Null
+                & scp.exe -q @($script:SshOpts) $staged "$($script:ResolvedTarget):.cargo/bin/clipsync" 2>&1 | Out-Null
+                Invoke-Ssh "chmod +x ~/.cargo/bin/clipsync" | Out-Null
+            }
+        } else {
+            Write-Warn2 "远端 arch=$arch 非 aarch64，跳过 clipsync 二进制推送（文件功能需匹配架构二进制）"
+        }
+    }
+
+    # 用 here-string + bash -s 方式喂脚本，避免 ssh 单行命令对 ; & 的 quote bug。
+    # DISPLAY/XAUTHORITY 必须显式 export（ssh non-interactive 不继承图形 session）——
+    # detect_x11 靠 xclip 读 X11 剪贴板检测文件复制；--data-key/--file-data-port 开启文件传输。
     $script = @"
 pkill -f 'cargo/bin/clipsync' 2>/dev/null || true
 sleep 1
@@ -581,21 +606,25 @@ if [ ! -x "`$HOME/.cargo/bin/clipsync" ]; then
     echo NOT_INSTALLED
     exit 0
 fi
+command -v xclip >/dev/null 2>&1 || echo NO_XCLIP
 export WAYLAND_DISPLAY=wayland-0
 export XDG_RUNTIME_DIR=/run/user/1000
 export DISPLAY=:0
 export XAUTHORITY=`$HOME/.Xauthority
-nohup "`$HOME/.cargo/bin/clipsync" --listen 0.0.0.0:$port > /tmp/clipsync.log 2>&1 < /dev/null &
+nohup "`$HOME/.cargo/bin/clipsync" --listen 0.0.0.0:$port --data-key '$key' --file-data-port $fileport > /tmp/clipsync.log 2>&1 < /dev/null &
 disown
 sleep 1
 pgrep -f cargo/bin/clipsync >/dev/null && echo OK || echo FAIL
 "@
     $out = Invoke-Ssh "bash -s" -Stdin $script
     $joined = ($out -join "`n")
+    if ($joined -match 'NO_XCLIP') {
+        Write-Warn2 "远端未装 xclip — 文件复制检测会失效！远端执行: sudo apt install -y xclip"
+    }
     if ($joined -match 'NOT_INSTALLED') {
-        Write-Warn2 "远端无 clipsync — 跑 .\connect.ps1 -Force 让远端自动安装"
+        Write-Warn2 "远端无 clipsync 二进制（本地暂存 bin\clipsync-linux-aarch64 缺失？）"
     } elseif ($joined -match 'OK') {
-        Write-OK "远端 clipsync 已 listen :$port"
+        Write-OK "远端 clipsync 已 listen :$port (文件模式, 数据端口 :$fileport)"
     } else {
         Write-Warn2 "远端 clipsync 状态不明: $joined"
     }
@@ -763,14 +792,16 @@ function Start-LocalClipsync {
     Remove-Item $stdoutLog,$stderrLog -ErrorAction SilentlyContinue
     Start-Process -FilePath $exe `
                   -ArgumentList @(
-                      '--connect', "$($script:ResolvedClipsyncTarget):$($script:ResolvedClipsyncPort)"
+                      '--connect', "$($script:ResolvedClipsyncTarget):$($script:ResolvedClipsyncPort)",
+                      '--data-key', $script:ResolvedAuthKey,
+                      '--file-data-port', "$($script:ResolvedFileDataPort)"
                   ) `
                   -WindowStyle Hidden `
                   -RedirectStandardOutput $stdoutLog `
                   -RedirectStandardError  $stderrLog | Out-Null
     Start-Sleep -Milliseconds 500
     if (Get-Process clipsync -ErrorAction SilentlyContinue) {
-        Write-OK "Windows clipsync 启动 (双向自动同步剪贴板文本)"
+        Write-OK "Windows clipsync 启动 (文本+文件模式, 数据端口 :$($script:ResolvedFileDataPort))"
     } else {
         Write-Warn2 "Windows clipsync 启动失败，看 $stderrLog"
     }
@@ -832,6 +863,7 @@ if ($script:ResolvedTarget -notmatch '@') {
 }
 $script:ResolvedDwellMs   = if ($cfg.PSObject.Properties.Name -contains 'DwellMs') { [int]$cfg.DwellMs } else { 0 }
 $script:ResolvedClipsyncPort = if ($PSBoundParameters.ContainsKey('ClipsyncPort')) { $ClipsyncPort } else { 4243 }
+$script:ResolvedFileDataPort = if ($PSBoundParameters.ContainsKey('FileDataPort')) { $FileDataPort } else { 4645 }
 $script:ResolvedClipsyncTarget = ($cfg.Target -replace '^.*@','' -replace ':.*$','')
 
 # 认证预共享 key（HMAC-SHA256）：两端 config 必须写同一个值，否则新版二进制 fail-closed
