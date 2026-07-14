@@ -24,12 +24,16 @@ pub fn parse_uri_list(raw: &str) -> Vec<PathBuf> {
         .filter_map(|l| l.strip_prefix("file://"))
         // file:///path → host 为空，剩下 /path；忽略带 host 的远程 URI
         .filter_map(|rest| {
-            let path = if let Some(slash) = rest.find('/') {
-                &rest[slash..]
-            } else {
+            // rest = <host>/path（file:// 已剥离）
+            // file:///path → host 为空字符串，放行。
+            // file://localhost/path → host == "localhost"，放行。
+            // file://otherhost/path → host 非空且不是 localhost，丢弃。
+            let slash_pos = rest.find('/')?;
+            let host = &rest[..slash_pos];
+            if !host.is_empty() && !host.eq_ignore_ascii_case("localhost") {
                 return None;
-            };
-            Some(PathBuf::from(percent_decode(path)))
+            }
+            Some(PathBuf::from(percent_decode(&rest[slash_pos..])))
         })
         .collect()
 }
@@ -123,5 +127,19 @@ mod tests {
                 PathBuf::from("/home/u/dir"),
             ]
         ); // 注释行与非 file:// 被过滤
+    }
+
+    #[test]
+    fn parse_uri_list_rejects_remote_host_accepts_localhost() {
+        // file://otherhost/x 被拒；file:///x 和 file://localhost/x 放行。
+        let raw = "file://otherhost/x\r\nfile:///home/u/b.txt\r\nfile://localhost/tmp/c.txt\r\n";
+        let paths = parse_uri_list(raw);
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/home/u/b.txt"),
+                PathBuf::from("/tmp/c.txt"),
+            ]
+        );
     }
 }

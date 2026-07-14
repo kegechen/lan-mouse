@@ -212,6 +212,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if key.is_empty() {
             warn!("--data-key empty: file paste will fail against a secured peer (data pulls are HMAC-authenticated)");
         }
+        // Windows 设计为 --connect 端：数据 target 从 --connect 主机推导。
+        // 若以 --listen 运行，target 退化为 127.0.0.1，文件拉取将失败。
+        if args.connect.is_none() && !key.is_empty() {
+            warn!("Windows 应作为 --connect 端；--listen 模式下文件拉取 target 无法确定，文件粘贴将失败");
+        }
         std::thread::spawn(move || run_owner(rx, target, key));
         info!(
             "clipboard file-offer owner thread spawned (data target {}:{})",

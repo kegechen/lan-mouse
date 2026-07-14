@@ -257,6 +257,8 @@ impl IStream_Impl for NetStream_Impl {
             *st = std::mem::zeroed();
             st.cbSize = self.size;
             st.r#type = 2; // STGTY_STREAM
+            // pwcsName 保持 NULL：STATFLAG_DEFAULT 严格语义要求 CoTaskMemAlloc 填写名字，
+            // 但 Explorer 复制引擎实测容忍 NULL，故省略以避免跨模块内存所有权问题。
         }
         Ok(())
     }

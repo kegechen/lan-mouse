@@ -38,6 +38,7 @@ pub const MAX_OFFER_BYTES: usize = 15 * 1024 * 1024;
 
 impl Manifest {
     pub fn to_json_bytes(&self) -> Vec<u8> {
+        // 本结构 serde 序列化不会失败（无自定义 Serializer、无 IO），expect 仅表意。
         serde_json::to_vec(self).expect("serialize manifest")
     }
     pub fn from_json_bytes(b: &[u8]) -> Result<Self, String> {
@@ -93,6 +94,10 @@ pub fn is_safe_relpath(rel: &str) -> bool {
 // 控制帧类型（FILE_OFFER / FILE_REVOKE）
 // ===========================================================================
 
+/// 控制帧类型枚举。
+///
+/// `main.rs` 出于 match 可读性直接用字面量（0x01/0x10/0x11）分发，本枚举供
+/// 协议文档 + 单测校验用，不视作死代码。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameKind {
     Text,
@@ -200,6 +205,9 @@ fn control_response(key: &[u8], nonce: &[u8; 16]) -> [u8; 32] {
 ///
 /// 线上（每方各发一次）：`[MAGIC 4][ver 1][nonce 16]`，随后 `[resp 32]`。
 /// 双方都「先写后读」，报文远小于 socket 缓冲，不会死锁。
+///
+/// **安全局限**：nonce 每连接新鲜，可防跨会话重放；同会话内被动抓包重放属
+/// B 档（明文）已知局限，未做 nonce 存储去重。
 pub async fn control_handshake<S>(
     stream: &mut S,
     key: &[u8],

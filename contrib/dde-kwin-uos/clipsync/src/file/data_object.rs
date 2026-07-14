@@ -104,7 +104,8 @@ mod com {
     use std::sync::atomic::{AtomicBool, Ordering};
     use windows::core::{implement, w, BOOL, Ref, HRESULT};
     use windows::Win32::Foundation::{
-        DV_E_FORMATETC, DV_E_LINDEX, E_NOTIMPL, HGLOBAL, OLE_E_ADVISENOTSUPPORTED, S_FALSE, S_OK,
+        DV_E_FORMATETC, DV_E_LINDEX, E_INVALIDARG, E_NOTIMPL, GlobalFree, HGLOBAL,
+        OLE_E_ADVISENOTSUPPORTED, S_FALSE, S_OK,
     };
     use windows::Win32::System::Com::{
         IAdviseSink, IBindCtx, IDataObject, IDataObject_Impl, IEnumFORMATETC, IEnumFORMATETC_Impl,
@@ -183,6 +184,8 @@ mod com {
         let h = GlobalAlloc(GMEM_MOVEABLE, bytes.len())?;
         let dst = GlobalLock(h);
         if dst.is_null() {
+            // GlobalLock 失败：释放刚分配的句柄再返回错误，避免 HGLOBAL 泄漏。
+            let _ = GlobalFree(Some(h));
             return Err(windows::core::Error::from(windows::Win32::Foundation::E_OUTOFMEMORY));
         }
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst as *mut u8, bytes.len());
@@ -353,6 +356,11 @@ mod com {
 
     impl IEnumFORMATETC_Impl for FormatEnumerator_Impl {
         fn Next(&self, celt: u32, rgelt: *mut FORMATETC, pceltfetched: *mut u32) -> HRESULT {
+            // COM 规范：rgelt 必须非空；celt>1 时 pceltfetched 也必须非空（调用方无法
+            // 否则得知实际填了几个）。任一违规返回 E_INVALIDARG。
+            if rgelt.is_null() || (celt > 1 && pceltfetched.is_null()) {
+                return E_INVALIDARG;
+            }
             let mut pos = self.pos.lock().unwrap();
             let mut fetched = 0u32;
             while fetched < celt && *pos < self.formats.len() {
