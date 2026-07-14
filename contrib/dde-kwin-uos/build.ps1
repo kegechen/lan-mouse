@@ -127,6 +127,26 @@ $clipsyncExe = Join-Path $clipsyncDir 'target\release\clipsync.exe'
 if (-not (Test-Path $clipsyncExe)) { throw "clipsync.exe not found at $clipsyncExe" }
 Write-OK ("clipsync.exe: " + [math]::Round((Get-Item $clipsyncExe).Length / 1MB, 2) + " MB")
 
+# ---------- 4.5. 交叉编 aarch64-linux-musl（可选，需要 zig + cargo-zigbuild）----------
+Write-H "[4.5] cross-compile clipsync for aarch64-unknown-linux-musl (optional)"
+$clipsyncAarch64 = $null
+if ((Get-Command zig -ErrorAction SilentlyContinue) -and (Get-Command cargo-zigbuild -ErrorAction SilentlyContinue)) {
+    Push-Location $clipsyncDir
+    try {
+        & cargo zigbuild --release --target aarch64-unknown-linux-musl
+        if ($LASTEXITCODE -ne 0) { throw "clipsync aarch64 cross-build failed (exit $LASTEXITCODE)" }
+    } finally { Pop-Location }
+    $aarch64Out = Join-Path $clipsyncDir 'target\aarch64-unknown-linux-musl\release\clipsync'
+    if (Test-Path $aarch64Out) {
+        $clipsyncAarch64 = $aarch64Out
+        Write-OK ("clipsync-linux-aarch64: " + [math]::Round((Get-Item $aarch64Out).Length / 1MB, 2) + " MB")
+    } else {
+        Write-Wm "aarch64 交叉编译完成但产物不存在于 $aarch64Out"
+    }
+} else {
+    Write-Wm "未找到 zig/cargo-zigbuild，跳过 aarch64 交叉编译；connect.ps1 将复用远端已有 clipsync 或已暂存的 bin\clipsync-linux-aarch64"
+}
+
 # ---------- 5. 部署 ----------
 Write-H "[5/5] deploy"
 if ($NoDeploy) {
@@ -148,6 +168,10 @@ Start-Sleep -Milliseconds 600
 
 Copy-Item $lanMouseExe $bin -Force
 Copy-Item $clipsyncExe $bin -Force
+if ($clipsyncAarch64 -and (Test-Path $clipsyncAarch64)) {
+    Copy-Item $clipsyncAarch64 (Join-Path $bin 'clipsync-linux-aarch64') -Force
+    Write-OK "clipsync-linux-aarch64 deployed"
+}
 Copy-Item (Join-Path $ScriptDir 'connect.ps1') $DeployDir -Force
 Copy-Item (Join-Path $ScriptDir 'USAGE.md')    $DeployDir -Force
 
