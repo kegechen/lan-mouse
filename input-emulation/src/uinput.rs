@@ -38,7 +38,17 @@ unsafe impl Send for UinputEmulation {}
 
 impl UinputEmulation {
     pub(crate) fn new() -> Result<Self, UinputEmulationCreationError> {
-        let device = uinput::default()?
+        // uinput::default() 走 libudev 枚举 misc/uinput 拿 devnode；部分 UOS（无 libudev-dev、
+        // 走 pkg-config shim 链接的机器）上枚举返回 NotFound → 退回 dummy 后端，事件收到却不注入。
+        // /dev/uinput 是固定路径，udev 查不到就直接打开。
+        let builder = match uinput::default() {
+            Ok(b) => b,
+            Err(e) => {
+                log::warn!("uinput via udev failed ({e}), falling back to /dev/uinput");
+                uinput::open("/dev/uinput")?
+            }
+        };
+        let device = builder
             .name("lan-mouse-uinput")?
             .event(controller::Mouse::Left)?
             .event(controller::Mouse::Right)?
