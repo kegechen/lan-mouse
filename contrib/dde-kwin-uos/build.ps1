@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     一键 build + 部署 lan-mouse + clipsync 到本地，准备好 connect.ps1 即可使用。
 
@@ -174,6 +174,14 @@ if ($clipsyncAarch64 -and (Test-Path $clipsyncAarch64)) {
 }
 Copy-Item (Join-Path $ScriptDir 'connect.ps1') $DeployDir -Force
 Copy-Item (Join-Path $ScriptDir 'USAGE.md')    $DeployDir -Force
+
+# 远端编译源码：部署目录不是 git 仓库，connect.ps1 -Rebuild 靠 .source-repo 找回本仓库实时打包；
+# 同时刷新缓存包（含未提交改动）兜底仓库被挪走的情况 —— 之前缓存包从不刷新，重编一直编旧代码
+[System.IO.File]::WriteAllText((Join-Path $DeployDir '.source-repo'), $RepoRoot, [System.Text.UTF8Encoding]::new($false))
+$srcRef = (& git -C $RepoRoot stash create 2>$null | Out-String).Trim()
+if (-not $srcRef) { $srcRef = 'HEAD' }
+& git -C $RepoRoot archive --format=tar.gz -o (Join-Path $DeployDir 'lan-mouse-src.tar.gz') $srcRef
+if ($LASTEXITCODE -eq 0) { Write-OK "lan-mouse-src.tar.gz refreshed ($srcRef)" }
 
 # patches 归档：以后想给 UOS 端做完整重装时用
 Copy-Item (Join-Path $RepoRoot 'input-emulation\src\uinput.rs')  $patches -Force

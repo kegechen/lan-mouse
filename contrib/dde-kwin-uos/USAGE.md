@@ -41,7 +41,9 @@ Get-Help .\connect.ps1 -Examples
 | `-NoClipsync` | off | 禁用剪贴板同步 daemon |
 | `-DemoIndicator` | off | 让 indicator 永久显示（远程截图调试） |
 | `-Setup` | — | 强制重跑配置向导 |
-| `-Force` | — | 远端强制重新拉源码 + 编译（修复损坏的安装） |
+| `-Force` | — | 强制覆盖配置：方向被其它远端占用时，移除旧远端、由本次目标接管 |
+| `-Rebuild` | — | 远端强制重新打包源码 + 编译（修复损坏的安装 / 拉新 patch） |
+| `-ForgetSudo` | — | 清除本远端记住的 sudo 密码（密码改了会自动重问，一般不用） |
 | `-Stop` | — | 停止两端 daemon |
 
 CLI 参数会覆盖 `.connect-config.json` 的值（一次性，不写回）。
@@ -256,11 +258,11 @@ ssh uos@192.168.137.27 'stat -c %a:%U:%G /dev/uinput'
 # 应该输出 660:root:input
 ```
 
-如果不是 `660:root:input`，重跑 `.\connect.ps1 -Force` 会自动修。
+如果不是 `660:root:input`，重跑 `.\connect.ps1 -Rebuild` 会自动修。
 
 ### WiFi 频繁断流
 
-NetworkManager / Win 移动热点的 WiFi 省电问题。`-Force` 重装会重设；
+NetworkManager / Win 移动热点的 WiFi 省电问题。`-Rebuild` 重装会重设；
 或手动：
 
 ```bash

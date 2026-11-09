@@ -5,3 +5,5 @@
 .vscode/
 .direnv/
 result
+.connect-config.json
+.sudo-cache.json
